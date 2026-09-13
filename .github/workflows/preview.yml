@@ -76,14 +76,19 @@ jobs:
       - name: Build for preview
         run: ${{ inputs.build-command }}
 
+      - name: Install flyctl
+        run: curl -L https://fly.io/install.sh | sh
+
       - name: Deploy and capture the URL
         id: deploy
         env:
           PREVIEW_REF: ${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}
           PREVIEW_URL_FILE: ${{ runner.temp }}/preview-url.txt
           DEPLOY_TOKEN: ${{ secrets.deploy-token }}
+          FLY_API_TOKEN: ${{ secrets.deploy-token }}
         run: |
           set -euo pipefail
+          export PATH="$HOME/.fly/bin:$PATH"
           : > "$PREVIEW_URL_FILE"
           ${{ inputs.deploy-command }}
           url=$(cat "$PREVIEW_URL_FILE")
