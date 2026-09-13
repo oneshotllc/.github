@@ -60,15 +60,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          os=$(uname -s)
           arch=$(uname -m)
-          case "$arch" in
-            arm64) plat="darwin_arm64" ;;
-            x86_64) plat="linux_amd64" ;;
-            *) plat="linux_amd64" ;;
-          esac
-          if [ "$(uname -s)" = "Linux" ]; then plat="linux_amd64"; fi
+          if [ "$os" = "Linux" ]; then
+            case "$arch" in
+              arm64|aarch64) plat="linux_arm64" ;;
+              *) plat="linux_x64" ;;
+            esac
+          else
+            case "$arch" in
+              arm64) plat="darwin_arm64" ;;
+              *) plat="darwin_x64" ;;
+            esac
+          fi
           url=$(gh api repos/gitleaks/gitleaks/releases/latest \
-            --jq ".assets[] | select(.name | test(\"$plat\")) | .browser_download_url" | head -n1)
+            --jq ".assets[] | select(.name | contains(\"_${plat}.\")) | .browser_download_url" | head -n1)
           mkdir -p "$RUNNER_TEMP/gitleaks-bin"
           curl -fsSL "$url" | tar -xz -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
           echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
