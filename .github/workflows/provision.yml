@@ -1,0 +1,29 @@
+name: Provision (manual trigger)
+
+on:
+  workflow_dispatch:
+    inputs:
+      org_name:
+        description: Organization/site name to provision.
+        required: true
+        type: string
+      domain:
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  provision:
+    uses: ./.github/workflows/provision-site.yml
+    with:
+      org_name: ${{ inputs.org_name }}
+      domain: ${{ inputs.domain }}
+      dry_run: ${{ inputs.dry_run }}
+    secrets:
+      pr-app-id: ${{ secrets.PR_APP_ID }}
+      pr-app-private-key: ${{ secrets.PR_APP_PRIVATE_KEY }}
+      fly-api-token: ${{ secrets.FLY_API_TOKEN }}
