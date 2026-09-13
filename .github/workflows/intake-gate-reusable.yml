@@ -1,0 +1,107 @@
+name: Intake Gate (reusable)
+
+on:
+  workflow_call: {}
+
+permissions:
+  issues: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issues'
+    steps:
+      - name: Validate issue shape and label deterministically
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Deterministic shape gate — no LLM calls. Parses the Issue Form's
+            // rendered "### Heading" sections and labels the issue accordingly.
+            const KNOWN_ORGS = ["OneShotMN", "Voices of Power", "10K Lakes Cannabis", "Good Neighbor", "Bella", "Other/new-org"];
+            const REQUIRED_SECTIONS = ["Org", "Given", "When", "Then", "Evidence", "Priority"];
+            const MARKER = "<!-- oneshot-intake-gate -->";
+
+            const issue = context.payload.issue;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const author = issue.user.login;
+            const isBot = issue.user.type === "Bot" || /\[bot\]$/.test(author);
+
+            async function setLabels(add, remove) {
+              for (const l of remove) {
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: issue.number, name: l });
+                } catch (e) {
+                  // label wasn't present on the issue — fine, nothing to remove
+                }
+              }
+              if (add.length) {
+                await github.rest.issues.addLabels({ owner, repo, issue_number: issue.number, labels: add });
+              }
+            }
+
+            async function upsertComment(body) {
+              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: issue.number });
+              const existing = comments.find(c => c.body && c.body.includes(MARKER));
+              const full = `${MARKER}\n${body}`;
+              if (existing) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body: full });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body: full });
+              }
+            }
+
+            if (isBot) {
+              await setLabels(["intake:machine"], ["invalid:shape", "intake:valid"]);
+              console.log(`${author} is a bot; labeled intake:machine, skipped shape gating.`);
+              return;
+            }
+
+            const body = issue.body || "";
+            const sections = {};
+            const re = /^###\s+(.+?)\s*$/gm;
+            let match;
+            const heads = [];
+            while ((match = re.exec(body)) !== null) {
+              heads.push({ name: match[1].trim(), index: match.index, end: re.lastIndex });
+            }
+            for (let i = 0; i < heads.length; i++) {
+              const start = heads[i].end;
+              const stop = i + 1 < heads.length ? heads[i + 1].index : body.length;
+              sections[heads[i].name] = body.slice(start, stop).trim();
+            }
+
+            function isEmpty(v) {
+              if (v === undefined) return true;
+              const t = v.trim();
+              return t === "" || t === "_No response_";
+            }
+
+            const failures = [];
+
+            for (const s of REQUIRED_SECTIONS) {
+              if (isEmpty(sections[s])) {
+                failures.push(`**${s}** is missing or empty. Expected a \`### ${s}\` section with real content (not placeholder text).`);
+              }
+            }
+
+            if (!isEmpty(sections["Org"]) && !KNOWN_ORGS.includes(sections["Org"].trim())) {
+              failures.push(`**Org** value \`${sections["Org"].trim()}\` is not one of the known orgs: ${KNOWN_ORGS.join(", ")}.`);
+            }
+
+            if (!isEmpty(sections["Priority"])) {
+              const p = sections["Priority"].trim().toLowerCase();
+              if (!["urgent", "high", "medium", "low"].includes(p)) {
+                failures.push(`**Priority** value \`${sections["Priority"].trim()}\` must be one of: urgent, high, medium, low.`);
+              }
+            }
+
+            if (failures.length === 0) {
+              await setLabels(["intake:valid"], ["invalid:shape"]);
+              console.log("Intake gate PASS: labeled intake:valid.");
+            } else {
+              await setLabels(["invalid:shape"], ["intake:valid"]);
+              const list = failures.map(f => `- ${f}`).join("\n");
+              await upsertComment(`@${author} this ticket doesn't match the required shape yet:\n\n${list}\n\nEdit the issue body to fix the field(s) above — the gate re-checks automatically on every edit.`);
+              console.log("Intake gate FAIL: labeled invalid:shape, comment upserted.");
+            }
