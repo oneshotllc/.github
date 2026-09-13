@@ -1,0 +1,76 @@
+name: Dependencies
+
+# Approve and arm auto-merge for every open Dependabot pull request whose
+# required check is green; leave everything else for a person. Runs the base
+# branch's copy (workflow_run defaults to the default branch) so a pull
+# request cannot rewrite the thing that decides whether to merge it.
+
+on:
+  workflow_call:
+    inputs:
+      required-check-context:
+        description: The commit status/check-run context that must be green (e.g. "check").
+        required: false
+        type: string
+        default: "check"
+      merge-method:
+        required: false
+        type: string
+        default: "squash"
+    secrets:
+      app-id:
+        required: true
+      app-private-key:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: deps-${{ github.workflow_ref }}
+  cancel-in-progress: false
+
+jobs:
+  act:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Mint the app token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name || github.repository }}
+
+      - name: Act on every open Dependabot pull request
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          CONTEXT: ${{ inputs.required-check-context }}
+          MERGE_METHOD: ${{ inputs.merge-method }}
+        run: |
+          set -uo pipefail
+          left=0
+          prs=$(gh pr list --repo "$GITHUB_REPOSITORY" --author "app/dependabot" --state open --json number --jq '.[].number')
+          for pr in $prs; do
+            conclusion=$(gh pr checks "$pr" --repo "$GITHUB_REPOSITORY" --json name,state --jq \
+              "[.[] | select(.name==\"$CONTEXT\")][0].state" 2>/dev/null || echo "")
+            if [ "$conclusion" = "SUCCESS" ]; then
+              gh pr review "$pr" --repo "$GITHUB_REPOSITORY" --approve >/dev/null 2>&1 || true
+              gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --auto "--${MERGE_METHOD}" >/dev/null 2>&1 || true
+              echo "Armed #$pr"
+            else
+              echo "Left #$pr for a person (check state: ${conclusion:-unknown})"
+              left=$((left + 1))
+            fi
+          done
+          {
+            echo "## Dependabot queue"
+            echo
+            echo "Left for a person: $left"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$left" -ne 0 ]; then
+            echo "::warning::$left Dependabot pull request(s) need a person to read them."
+          fi
