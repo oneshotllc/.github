@@ -1,0 +1,129 @@
+name: Provision site
+
+# The site provisioner: turns one organization name into a complete,
+# working site system — a repo cloned from oneshotmn/site-template, its
+# __TOKEN__ placeholders substituted, a Fly app + volume, an admin
+# passphrase, the repo secrets the caller-stub workflows need, an entry in
+# oneshot-pipeline's organizations.yaml, and a first preview build.
+#
+# Every step converges (idempotent — safe to run twice for the same org).
+# Anything requiring a credential this runner doesn't have files a
+# provisioning ticket in oneshotmn/.github and provisioning continues past
+# it (see scripts/provisioner/provision.py's ticket contract).
+#
+# Runs on ubuntu-latest deliberately: the org's only self-hosted runner is
+# scoped to oneshotmn/oneshotmn (legacy, out of scope — never touched by
+# this workflow) and is not available to other repos.
+
+on:
+  workflow_call:
+    inputs:
+      org_name:
+        description: The organization/site name to provision, e.g. "Voices of Power".
+        required: true
+        type: string
+      domain:
+        description: Optional custom domain. Defaults to <slug>.oneshot.help.
+        required: false
+        type: string
+        default: ""
+      region:
+        description: Fly.io region for the app + volume.
+        required: false
+        type: string
+        default: "ord"
+      dry_run:
+        description: Compute the plan (slug, repo, fly app, domain) without creating anything.
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      pr-app-id:
+        description: The oneshot-pr GitHub App's ID, for identity on repo/git operations.
+        required: true
+      pr-app-private-key:
+        description: The oneshot-pr GitHub App's private key.
+        required: true
+      fly-api-token:
+        description: A Fly.io API token able to create apps/volumes in the oneshot-llc org.
+        required: true
+    outputs:
+      repo:
+        description: The full "owner/name" of the provisioned repository.
+        value: ${{ jobs.provision.outputs.repo }}
+      slug:
+        description: The derived org slug.
+        value: ${{ jobs.provision.outputs.slug }}
+      fly_app:
+        description: The Fly app name.
+        value: ${{ jobs.provision.outputs.fly_app }}
+      tickets_filed:
+        description: Count of provisioning tickets filed for follow-up.
+        value: ${{ jobs.provision.outputs.tickets_filed }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provision-site-${{ inputs.org_name }}
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      repo: ${{ steps.run.outputs.repo }}
+      slug: ${{ steps.run.outputs.slug }}
+      fly_app: ${{ steps.run.outputs.fly_app }}
+      tickets_filed: ${{ steps.run.outputs.tickets_filed }}
+    steps:
+      - name: Check out this repo's provisioner scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            scripts/provisioner
+
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install provisioner dependencies
+        run: pip install --quiet pyyaml
+
+      - name: Mint the oneshot-pr app token (used for every gh/git call)
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.pr-app-id }}
+          private-key: ${{ secrets.pr-app-private-key }}
+
+      - name: Install flyctl
+        run: curl -L https://fly.io/install.sh | sh
+
+      - name: Run the provisioner
+        id: run
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          FLY_API_TOKEN: ${{ secrets.fly-api-token }}
+          PR_APP_ID_VALUE: ${{ secrets.pr-app-id }}
+          PR_APP_PRIVATE_KEY_VALUE: ${{ secrets.pr-app-private-key }}
+          ORG_NAME: ${{ inputs.org_name }}
+          DOMAIN: ${{ inputs.domain }}
+          REGION: ${{ inputs.region }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.fly/bin:$PATH"
+          python scripts/provisioner/ci_entrypoint.py
+
+      - name: Report the plan
+        env:
+          REPO: ${{ steps.run.outputs.repo }}
+          TICKETS: ${{ steps.run.outputs.tickets_filed }}
+        run: |
+          {
+            echo "## Provisioned $REPO"
+            echo
+            echo "Tickets filed for follow-up: ${TICKETS:-0}"
+          } >> "$GITHUB_STEP_SUMMARY"
