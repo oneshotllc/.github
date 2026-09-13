@@ -1,0 +1,101 @@
+name: Auto-merge
+
+# Queue an agent's pull request behind its required checks, so a green
+# required check merges it instead of leaving it sitting until someone
+# notices. `pull_request_target` so the guard runs the base branch's copy,
+# never the head's. Attributed to a minted app installation token, never
+# `github.token`, so the merge fires a real `closed` event (GitHub suppresses
+# events for anything GITHUB_TOKEN did).
+
+on:
+  workflow_call:
+    inputs:
+      runs-on-label:
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      expected-author:
+        description: Only pull requests opened by this login are queued.
+        required: true
+        type: string
+      merge-method:
+        description: merge, squash, or rebase.
+        required: false
+        type: string
+        default: "merge"
+      close-linked-issues:
+        description: On merge, close issues referenced by closing keywords in the PR body/title.
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      app-id:
+        required: true
+      app-private-key:
+        required: true
+
+concurrency:
+  group: automerge-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  enable:
+    if: >-
+      github.event.action != 'closed' &&
+      github.event.pull_request.draft == false
+    runs-on: ${{ fromJSON(inputs.runs-on-label) }}
+    env:
+      PR: ${{ github.event.pull_request.number }}
+      AUTHOR: ${{ github.event.pull_request.user.login }}
+    steps:
+      - name: Mint the app token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+
+      - name: Queue behind required checks
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          EXPECTED: ${{ inputs.expected-author }}
+          MERGE_METHOD: ${{ inputs.merge-method }}
+        run: |
+          set -euo pipefail
+          if [ "${AUTHOR:-}" != "$EXPECTED" ]; then
+            echo "::notice::Auto-merge not armed for #$PR — author is '$AUTHOR', expected '$EXPECTED'."
+            exit 0
+          fi
+          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --auto "--${MERGE_METHOD}"
+          echo "Auto-merge armed for #$PR." >> "$GITHUB_STEP_SUMMARY"
+
+  close-linked-issues:
+    if: >-
+      inputs.close-linked-issues &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true
+    runs-on: ${{ fromJSON(inputs.runs-on-label) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Close issues this pull request closes
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          BODY: ${{ github.event.pull_request.body }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          text="$TITLE"$'\n'"$BODY"
+          nums=$(printf '%s' "$text" | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?) #[0-9]+' | grep -oE '[0-9]+' | sort -u)
+          for n in $nums; do
+            state=$(gh api "repos/$GITHUB_REPOSITORY/issues/$n" --jq .state 2>/dev/null || echo "")
+            if [ "$state" = "open" ]; then
+              gh api "repos/$GITHUB_REPOSITORY/issues/$n" -X PATCH -f state=closed >/dev/null
+              echo "Closed #$n"
+            fi
+          done

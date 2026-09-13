@@ -1,0 +1,69 @@
+name: Preview bootstrap
+
+# One-time (or re-runnable) creation of whatever the preview deploy target
+# needs to exist before preview.yml can upload to it. The caller supplies the
+# exact bootstrap command for its stack (e.g. `wrangler deploy` for a Worker,
+# or `flyctl apps create` for Fly).
+
+on:
+  workflow_call:
+    inputs:
+      runs-on-label:
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      node-version:
+        required: false
+        type: string
+        default: "24"
+      install-command:
+        required: false
+        type: string
+        default: "npm ci"
+      build-command:
+        required: false
+        type: string
+        default: ""
+      bootstrap-command:
+        description: Creates the preview deploy target. Required.
+        required: true
+        type: string
+    secrets:
+      deploy-token:
+        required: false
+
+concurrency:
+  group: preview-bootstrap-${{ github.workflow_ref }}
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ${{ fromJSON(inputs.runs-on-label) }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - if: inputs.node-version != ''
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - if: inputs.install-command != ''
+        run: ${{ inputs.install-command }}
+
+      - if: inputs.build-command != ''
+        run: ${{ inputs.build-command }}
+
+      - name: Create the preview deploy target
+        env:
+          DEPLOY_TOKEN: ${{ secrets.deploy-token }}
+        run: ${{ inputs.bootstrap-command }}
+
+      - name: Record that bootstrap ran
+        run: |
+          {
+            echo "## Preview bootstrap ran"
+            echo
+            echo "The preview deploy target exists. \`preview.yml\` can upload to it now."
+          } >> "$GITHUB_STEP_SUMMARY"
