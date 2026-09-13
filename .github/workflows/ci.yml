@@ -1,0 +1,91 @@
+name: CI
+
+# Reusable CI check. Runs an arbitrary caller-supplied shell command after an
+# optional Node.js setup, on a caller-chosen runner label. No model call, no
+# repo-specific paths: the caller decides what "check" means for its stack by
+# passing the command(s) it wants run.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on-label:
+        description: >-
+          JSON array (as a string) of runner labels, e.g. '["self-hosted","oneshot-mac"]'
+          or '"ubuntu-latest"'. Passed straight to `runs-on`.
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      node-version:
+        description: Node.js version to install. Empty string skips Node setup.
+        required: false
+        type: string
+        default: "24"
+      install-command:
+        description: Command that installs dependencies.
+        required: false
+        type: string
+        default: "npm ci"
+      check-command:
+        description: The command that decides pass/fail for this repo's stack.
+        required: false
+        type: string
+        default: "npm run lint && npm run typecheck && npm test && npm run build"
+      enable-gitleaks:
+        description: Scan the checkout for secrets with gitleaks before check-command runs.
+        required: false
+        type: boolean
+        default: true
+      gitleaks-config:
+        description: Path to a gitleaks config file. Empty uses gitleaks defaults.
+        required: false
+        type: string
+        default: ".gitleaks.toml"
+
+jobs:
+  check:
+    runs-on: ${{ fromJSON(inputs.runs-on-label) }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - if: inputs.node-version != ''
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install gitleaks
+        if: inputs.enable-gitleaks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          case "$arch" in
+            arm64) plat="darwin_arm64" ;;
+            x86_64) plat="linux_amd64" ;;
+            *) plat="linux_amd64" ;;
+          esac
+          if [ "$(uname -s)" = "Linux" ]; then plat="linux_amd64"; fi
+          url=$(gh api repos/gitleaks/gitleaks/releases/latest \
+            --jq ".assets[] | select(.name | test(\"$plat\")) | .browser_download_url" | head -n1)
+          mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+          curl -fsSL "$url" | tar -xz -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
+          echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
+
+      - name: Scan for secrets
+        if: inputs.enable-gitleaks
+        run: |
+          set -euo pipefail
+          if [ -f "${{ inputs.gitleaks-config }}" ]; then
+            gitleaks detect --no-git --source . --config "${{ inputs.gitleaks-config }}" --redact
+          else
+            gitleaks detect --no-git --source . --redact
+          fi
+
+      - name: Install dependencies
+        if: inputs.install-command != ''
+        run: ${{ inputs.install-command }}
+
+      - name: Run the caller's check command
+        run: ${{ inputs.check-command }}
