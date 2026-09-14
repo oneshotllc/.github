@@ -86,17 +86,23 @@ def main() -> int:
         _emit_outputs(repo=repo, slug=slug, fly_app=fly_app, tickets_filed=0)
         return 0
 
-    step_create_repo(sh, repo=repo, template_repo="oneshotmn/site-template")
+    create_ticket = step_create_repo(sh, repo=repo, template_repo="oneshotmn/site-template")
+    if create_ticket:
+        tickets.append(create_ticket)
+        file_ticket(sh, create_ticket)
+        _emit_outputs(repo=repo, slug=slug, fly_app=fly_app, tickets_filed=len(tickets))
+        raise SystemExit(f"create_repo did not converge for {repo}: {create_ticket.hit}")
 
     # Token substitution: clone, replace __TOKEN__s, commit + push idempotently.
     clone_dir = Path("/tmp") / f"provision-{slug}"
     if clone_dir.exists():
         subprocess.run(["rm", "-rf", str(clone_dir)])
-    clone_url = f"https://x-access-token:{os.environ['GH_TOKEN']}@github.com/{repo}.git"
+    token = os.environ["GH_TOKEN"]
+    clone_url = "https://x-access-token:" + token + "@github.com/" + repo + ".git"
     clone = subprocess.run(["git", "clone", clone_url, str(clone_dir)], capture_output=True, text=True)
     if clone.returncode != 0:
         print(clone.stderr, file=sys.stderr)
-        raise SystemExit(f"git clone of {repo} failed: {clone.stderr.strip()}")
+        raise SystemExit(f"git clone of {repo} failed: " + clone.stderr.strip())
     sub = subprocess.run(
         [
             sys.executable, str(Path(__file__).parent / "substitute.py"), str(clone_dir),

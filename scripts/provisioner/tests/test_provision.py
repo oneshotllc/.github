@@ -17,6 +17,7 @@ from provisioner.provision import (
     derive_slug,
     generate_passphrase,
     provision_site,
+    step_create_repo,
     step_ensure_fly_app,
     step_register_organization,
     step_set_repo_secrets,
@@ -103,6 +104,58 @@ def test_generate_passphrase_is_not_a_hex_token():
 def test_generate_passphrase_varies_across_calls():
     seen = {generate_passphrase() for _ in range(20)}
     assert len(seen) > 1
+
+
+# --- step_create_repo -----------------------------------------------------
+
+
+def test_step_create_repo_converges_when_already_exists():
+    sh = FakeShell({("view", "existing/repo"): cp(returncode=0, stdout='{"name":"repo"}')})
+    ticket = step_create_repo(sh, repo="existing/repo", template_repo="org/tmpl")
+    assert ticket is None
+    assert not any("create" in c for c in sh.calls)
+
+
+def test_step_create_repo_polls_until_branches_appear(monkeypatch):
+    """GitHub's --template copy is async: gh repo create returns before the
+    new repo has any commits. A clone right after create can race that job
+    and silently get an empty repo (observed live on run 34791251371).
+    step_create_repo must poll branches until non-empty before returning.
+    """
+    monkeypatch.setattr("provisioner.provision._time.sleep", lambda *_: None)
+    state = {"n": 0}
+
+    class PollingFakeShell(FakeShell):
+        def _respond(self, argv):
+            self.calls.append(argv)
+            if "branches" in " ".join(argv):
+                state["n"] += 1
+                if state["n"] < 3:
+                    return cp(returncode=0, stdout="[]")
+                return cp(returncode=0, stdout='[{"name":"main"}]')
+            for pattern, resp in self.responses.items():
+                if all(p in argv for p in pattern):
+                    return resp
+            return self.default
+
+    sh = PollingFakeShell({("view", "org/new-repo"): cp(returncode=1)})
+    ticket = step_create_repo(sh, repo="org/new-repo", template_repo="org/tmpl", poll_interval_seconds=0)
+    assert ticket is None
+    assert state["n"] == 3
+
+
+def test_step_create_repo_files_ticket_when_copy_never_lands(monkeypatch):
+    monkeypatch.setattr("provisioner.provision._time.sleep", lambda *_: None)
+    sh = FakeShell({
+        ("view", "org/stuck-repo"): cp(returncode=1),
+        ("api",): cp(returncode=0, stdout="[]"),
+    })
+    ticket = step_create_repo(
+        sh, repo="org/stuck-repo", template_repo="org/tmpl",
+        poll_attempts=3, poll_interval_seconds=0,
+    )
+    assert isinstance(ticket, ProvisioningTicket)
+    assert "org/stuck-repo" in ticket.title
 
 
 # --- step_ensure_fly_app -------------------------------------------------
@@ -208,10 +261,12 @@ def test_set_repo_secrets_succeeds_when_source_exists_and_gh_succeeds(tmp_path: 
 
 
 def test_provision_site_full_run_reports_every_step(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("provisioner.provision._time.sleep", lambda *_: None)
     orgs_path = tmp_path / "organizations.yaml"
     orgs_path.write_text(yaml.safe_dump([]))
     sh = FakeShell(responses={
         ("repo", "view"): cp(returncode=1),  # does not exist yet
+        ("api",): cp(returncode=0, stdout='[{"name":"main"}]'),  # branches after template copy
         ("apps", "list"): cp(returncode=0, stdout="[]"),
         ("workflow", "run"): cp(returncode=0),
     })

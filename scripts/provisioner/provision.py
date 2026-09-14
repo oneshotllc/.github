@@ -19,6 +19,7 @@ import re
 import secrets as _secrets
 import subprocess
 import sys
+import time as _time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -132,13 +133,41 @@ class Shell:
 # ---------------------------------------------------------------------------
 
 
-def step_create_repo(sh: Shell, *, repo: str, template_repo: str) -> None:
+def step_create_repo(
+    sh: Shell, *, repo: str, template_repo: str,
+    poll_attempts: int = 10, poll_interval_seconds: float = 2.0,
+) -> ProvisioningTicket | None:
+    """gh repo create --template only *starts* GitHub's template-copy job;
+    it returns before the new repo has any commits. A clone started right
+    after create races that async job and silently gets an empty
+    repository (observed live: run 34791251371's follow-on clone step
+    failed 'repository not found' on a repo gh had just reported as
+    created). Poll branch list until non-empty (i.e. the copy landed a
+    default branch with commits) before handing back to the caller.
+    """
     exists = sh.gh("repo", "view", repo, "--json", "name")
     if exists.returncode == 0:
-        return  # converge: already provisioned
+        return None  # converge: already provisioned, already has content
+
     sh.gh(
         "repo", "create", repo, "--template", template_repo, "--private",
         "--description", f"Provisioned by provision-site.yml from {template_repo}",
+    )
+
+    for _ in range(poll_attempts):
+        branches = sh.gh("api", f"repos/{repo}/branches")
+        if branches.returncode == 0 and branches.stdout.strip() not in ("", "[]"):
+            return None
+        _time.sleep(poll_interval_seconds)
+
+    return ProvisioningTicket(
+        title=f"Template copy into {repo} did not finish in time",
+        tried=(
+            f"gh repo create {repo} --template {template_repo}, then polled "
+            f"repos/{repo}/branches {poll_attempts}x every {poll_interval_seconds}s"
+        ),
+        hit="Repo exists but has no branches after the poll window — GitHub's async template-copy job is still running or stalled.",
+        need="Manually verify oneshotmn/site-template's template-copy completed, or re-run provisioning once it has.",
     )
 
 
@@ -247,8 +276,12 @@ def provision_site(
         domain=domain, theme_tokens=theme_tokens,
     )
 
-    step_create_repo(sh, repo=repo, template_repo=template_repo)
-    result.steps_completed.append("create_repo")
+    create_ticket = step_create_repo(sh, repo=repo, template_repo=template_repo)
+    if create_ticket:
+        result.tickets.append(create_ticket)
+        file_ticket(sh, create_ticket)
+    else:
+        result.steps_completed.append("create_repo")
 
     # Step 2 (token substitution) runs as its own script — see substitute.py
     # — invoked by provision-site.yml directly against the checked-out repo,
