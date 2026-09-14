@@ -111,7 +111,10 @@ def test_generate_passphrase_varies_across_calls():
 
 
 def test_step_create_repo_converges_when_already_exists():
-    sh = FakeShell({("view", "existing/repo"): cp(returncode=0, stdout='{"name":"repo"}')})
+    sh = FakeShell({
+        ("view", "existing/repo"): cp(returncode=0, stdout='{"name":"repo"}'),
+        ("api",): cp(returncode=0, stdout='[{"name":"main"}]'),  # copy already landed
+    })
     step_create_repo(sh, repo="existing/repo", template_repo="org/tmpl")
     assert not any("create" in c for c in sh.calls)
 
@@ -320,6 +323,7 @@ def test_provision_site_is_idempotent_when_repo_already_exists(tmp_path: Path, m
     orgs_path.write_text(yaml.safe_dump([]))
     sh = FakeShell(responses={
         ("repo", "view"): cp(returncode=0),  # already exists
+        ("api",): cp(returncode=0, stdout='[{"name":"main"}]'),  # copy already landed
         ("apps", "list"): cp(returncode=0, stdout='[{"Name": "acme-corp"}]'),
         ("workflow", "run"): cp(returncode=0),
     })
@@ -367,3 +371,28 @@ def test_provision_site_files_ticket_and_continues_when_fly_blocked(tmp_path: Pa
     # Provisioning must continue past the blocked step:
     assert "register_organization" in result.steps_completed
     assert "trigger_preview" in result.steps_completed
+
+
+def test_step_create_repo_waits_when_existing_repo_is_still_empty(monkeypatch):
+    """Regression, live run 34791830298: an earlier run created the repo then
+    died while GitHub's template copy was still in flight. step_create_repo
+    returned early on "repo exists", so every retry stranded on a branchless
+    repo and the provisioner ticketed a human instead of simply waiting."""
+    monkeypatch.setattr("provisioner.provision._time.sleep", lambda *_: None)
+    state = {"n": 0}
+
+    class SlowCopyShell(FakeShell):
+        def _respond(self, argv):
+            self.calls.append(argv)
+            if "branches" in " ".join(argv):
+                state["n"] += 1
+                return cp(returncode=0, stdout="[]" if state["n"] < 3 else '[{"name":"main"}]')
+            for pattern, resp in self.responses.items():
+                if all(p in argv for p in pattern):
+                    return resp
+            return self.default
+
+    sh = SlowCopyShell({("view", "org/empty-repo"): cp(returncode=0, stdout='{"name":"empty-repo"}')})
+    step_create_repo(sh, repo="org/empty-repo", template_repo="org/tmpl")
+    assert state["n"] == 3, "must keep polling an existing-but-empty repo"
+    assert not any("create" in c for c in sh.calls), "must not recreate an existing repo"

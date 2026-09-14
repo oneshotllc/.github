@@ -160,12 +160,17 @@ def step_create_repo(
     """
     exists = sh.gh("repo", "view", repo, "--json", "name")
     if exists.returncode == 0:
-        return  # converge: already provisioned, already has content
-
-    sh.gh(
-        "repo", "create", repo, "--template", template_repo, "--private",
-        "--description", f"Provisioned by provision-site.yml from {template_repo}",
-    )
+        # Converge, but do NOT assume "exists" implies "has content": an
+        # earlier run can create the repo and die while GitHub's async
+        # template copy is still in flight (live: run 34791830298 left
+        # oneshotmn/template-proof branchless, and every retry returned
+        # here and stranded forever). Fall through to the same wait.
+        pass
+    else:
+        sh.gh(
+            "repo", "create", repo, "--template", template_repo, "--private",
+            "--description", f"Provisioned by provision-site.yml from {template_repo}",
+        )
 
     for wait_seconds in poll_schedule:
         branches = sh.gh("api", f"repos/{repo}/branches")
