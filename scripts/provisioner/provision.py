@@ -368,6 +368,23 @@ def step_set_fly_secrets(
     return None
 
 
+def step_ensure_public_ips(sh: Shell, *, fly_app: str) -> None:
+    """Allocate public ingress IPs, idempotently.
+
+    A deployed Machine serving 200 on its private address is NOT a reachable
+    site: without public ingress the hostname resolves to nothing and the
+    URL is dead from outside (live run 34803269910 reported success while
+    the address refused connections). `flyctl ips allocate-*` is a no-op
+    when the address already exists, so this converges.
+    """
+    listed = sh.run(["flyctl", "ips", "list", "--app", fly_app])
+    out = (listed.stdout or "")
+    if " v4 " not in out and "shared" not in out:
+        sh.run(["flyctl", "ips", "allocate-v4", "--shared", "--app", fly_app, "--yes"])
+    if " v6 " not in out:
+        sh.run(["flyctl", "ips", "allocate-v6", "--app", fly_app, "--yes"])
+
+
 def step_deploy_image(
     sh: Shell, *, fly_app: str, image_ref: str, region: str,
     config_path: str | None = None,

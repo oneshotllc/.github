@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time as _t
 import subprocess
 import sys
 from pathlib import Path
@@ -35,6 +36,7 @@ from provision import (  # noqa: E402
     derive_fly_app,
     ProvisioningError,
     step_ensure_fly_app,
+    step_ensure_public_ips,
     step_deploy_image,
     step_set_fly_secrets,
     step_set_repo_secrets,
@@ -225,7 +227,23 @@ def main() -> int:
         print(f"[promote] skipped: {domain} left untouched; site is at https://{fly_app}.fly.dev/")
 
     if image_ref:
+        # Public ingress must exist before the URL can answer anyone.
+        step_ensure_public_ips(sh, fly_app=fly_app)
+        # Require CONSECUTIVE successes: a single 200 can come from a warm
+        # edge while DNS has not propagated, which is how a green run handed
+        # Brian a dead link (run 34803269910).
         reached, elapsed = poll_until_200(_http_status, f"https://{fly_app}.fly.dev/")
+        if reached:
+            ok = 0
+            for _ in range(12):
+                if _http_status(f"https://{fly_app}.fly.dev/") == 200:
+                    ok += 1
+                    if ok >= 3:
+                        break
+                else:
+                    ok = 0
+                _t.sleep(2)
+            reached = ok >= 3
         print(f"poll_until_200: reached={reached} elapsed={elapsed:.2f}s")
         if reached:
             live_url = f"https://{fly_app}.fly.dev/"

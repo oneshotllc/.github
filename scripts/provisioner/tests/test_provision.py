@@ -500,3 +500,23 @@ def test_provisioning_does_not_touch_the_real_domain_by_default():
     dns_at = src.index("step_ensure_dns_record(http")
     gate_at = src.index("if promote:")
     assert gate_at < dns_at, "the DNS call must sit inside the promote gate"
+
+
+def test_public_ips_are_allocated_before_declaring_live():
+    """A Machine serving 200 privately is not a reachable site. Run
+    34803269910 reported success while the public URL refused connections
+    because no ingress IP existed yet."""
+    import inspect
+    from provisioner import ci_entrypoint
+    src = inspect.getsource(ci_entrypoint)
+    assert "step_ensure_public_ips" in src
+    assert src.index("step_ensure_public_ips") < src.index("reached, elapsed = poll_until_200")
+
+
+def test_liveness_requires_consecutive_successes():
+    """One 200 can come from a warm edge before DNS has propagated, which is
+    how a green run produced a link Brian could not open."""
+    import inspect
+    from provisioner import ci_entrypoint
+    src = inspect.getsource(ci_entrypoint)
+    assert "ok >= 3" in src, "must require repeated successes before calling a site live"
