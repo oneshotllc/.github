@@ -466,3 +466,23 @@ def test_taken_app_name_is_not_treated_as_success():
 
     with pytest.raises(ProvisioningError, match="taken"):
         step_ensure_fly_app(TakenShell({}), fly_app="oneshot", region="ord")
+
+
+def test_deploy_passes_the_sites_own_fly_config():
+    """Regression, live run 34801174422: the provisioner runs inside the
+    shared workflow repo, which has no fly.toml, so `flyctl deploy` tried to
+    rebuild one from existing machines and died on a brand-new app with
+    "could not create a fly.toml from any machines". The provisioned site's
+    fly.toml must be passed explicitly."""
+    from provisioner.provision import step_deploy_image
+
+    class OKShell(FakeShell):
+        def run(self, argv, check=False):
+            self.calls.append(argv)
+            return cp(returncode=0)
+
+    sh = OKShell({})
+    step_deploy_image(sh, fly_app="a", image_ref="img:live", region="ord",
+                      config_path="/tmp/site/fly.toml")
+    flat = " ".join(sh.calls[0])
+    assert "--config /tmp/site/fly.toml" in flat

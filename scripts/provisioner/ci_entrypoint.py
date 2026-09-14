@@ -187,7 +187,12 @@ def main() -> int:
 
     live_url: str | None = None
     if image_ref:
-        deploy_ticket = step_deploy_image(sh, fly_app=fly_app, image_ref=image_ref, region=region)
+        # Deploy with the PROVISIONED SITE's fly.toml: this process runs
+        # inside the shared workflow repo, which has none of its own.
+        deploy_ticket = step_deploy_image(
+            sh, fly_app=fly_app, image_ref=image_ref, region=region,
+            config_path=str(clone_dir / "fly.toml"),
+        )
         if deploy_ticket:
             tickets.append(deploy_ticket)
             file_ticket(sh, deploy_ticket)

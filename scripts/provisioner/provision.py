@@ -370,6 +370,7 @@ def step_set_fly_secrets(
 
 def step_deploy_image(
     sh: Shell, *, fly_app: str, image_ref: str, region: str,
+    config_path: str | None = None,
 ) -> ProvisioningTicket | None:
     """Deploys a PREBUILT image — never `flyctl deploy` from source, which
     would build during provisioning and put minutes of image-build time in
@@ -380,10 +381,18 @@ def step_deploy_image(
     # NOTE: `flyctl deploy` has no --region flag (live run 34798261207 died
     # on "unknown flag: --region" and mis-reported it as a token problem).
     # Region belongs to the app/volume, which step_ensure_fly_app already set.
-    deployed = sh.run([
+    # --config is mandatory: this runs from the shared workflow repo, which
+    # has no fly.toml, so flyctl otherwise tries to reconstruct one from
+    # existing machines and dies on a brand-new app with "could not create a
+    # fly.toml from any machines" (live run 34801174422). The provisioned
+    # site's own fly.toml is the source of truth for ports and mounts.
+    argv = [
         "flyctl", "deploy", "--app", fly_app, "--image", image_ref,
         "--strategy", "immediate", "--yes",
-    ])
+    ]
+    if config_path:
+        argv += ["--config", config_path]
+    deployed = sh.run(argv)
     if deployed.returncode != 0:
         # A failed deploy is a RUN failure - the command, the image or the
         # app is wrong, and all three are code. Never a human ticket.
