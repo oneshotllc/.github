@@ -133,41 +133,55 @@ class Shell:
 # ---------------------------------------------------------------------------
 
 
+class TemplateCopyTimeout(RuntimeError):
+    """Raised when GitHub's async --template copy job never lands a branch
+    within the backoff window. This is a hard run failure, not a
+    ProvisioningTicket: there is no human decision buried in it, just
+    GitHub taking longer than usual. Retrying the run (or waiting) fixes it.
+    """
+
+
 def step_create_repo(
     sh: Shell, *, repo: str, template_repo: str,
-    poll_attempts: int = 10, poll_interval_seconds: float = 2.0,
-) -> ProvisioningTicket | None:
+    poll_schedule: tuple[float, ...] = (1, 2, 4, 8, 15, 30, 30, 30, 30, 30),
+) -> None:
     """gh repo create --template only *starts* GitHub's template-copy job;
     it returns before the new repo has any commits. A clone started right
     after create races that async job and silently gets an empty
     repository (observed live: run 34791251371's follow-on clone step
     failed 'repository not found' on a repo gh had just reported as
-    created). Poll branch list until non-empty (i.e. the copy landed a
-    default branch with commits) before handing back to the caller.
+    created; run 34791830298 then showed a single 20s poll window is too
+    short — GitHub's copy can legitimately take longer). Poll the branch
+    list with exponential backoff (schedule sums to >=180s) until it is
+    non-empty (i.e. the copy landed a default branch with commits) before
+    handing back to the caller. This is a timing issue, not a missing
+    credential or a decision for a human — so on full timeout it raises
+    and fails the run loudly instead of filing a ticket.
     """
     exists = sh.gh("repo", "view", repo, "--json", "name")
     if exists.returncode == 0:
-        return None  # converge: already provisioned, already has content
+        return  # converge: already provisioned, already has content
 
     sh.gh(
         "repo", "create", repo, "--template", template_repo, "--private",
         "--description", f"Provisioned by provision-site.yml from {template_repo}",
     )
 
-    for _ in range(poll_attempts):
+    for wait_seconds in poll_schedule:
         branches = sh.gh("api", f"repos/{repo}/branches")
         if branches.returncode == 0 and branches.stdout.strip() not in ("", "[]"):
-            return None
-        _time.sleep(poll_interval_seconds)
+            return
+        _time.sleep(wait_seconds)
 
-    return ProvisioningTicket(
-        title=f"Template copy into {repo} did not finish in time",
-        tried=(
-            f"gh repo create {repo} --template {template_repo}, then polled "
-            f"repos/{repo}/branches {poll_attempts}x every {poll_interval_seconds}s"
-        ),
-        hit="Repo exists but has no branches after the poll window — GitHub's async template-copy job is still running or stalled.",
-        need="Manually verify oneshotmn/site-template's template-copy completed, or re-run provisioning once it has.",
+    # One last check after the final sleep before giving up.
+    branches = sh.gh("api", f"repos/{repo}/branches")
+    if branches.returncode == 0 and branches.stdout.strip() not in ("", "[]"):
+        return
+
+    total_wait = sum(poll_schedule)
+    raise TemplateCopyTimeout(
+        f"{repo}: GitHub's template-copy from {template_repo} produced no branches "
+        f"after {total_wait:.0f}s of backoff polling. Retryable — re-run provisioning."
     )
 
 
@@ -276,12 +290,8 @@ def provision_site(
         domain=domain, theme_tokens=theme_tokens,
     )
 
-    create_ticket = step_create_repo(sh, repo=repo, template_repo=template_repo)
-    if create_ticket:
-        result.tickets.append(create_ticket)
-        file_ticket(sh, create_ticket)
-    else:
-        result.steps_completed.append("create_repo")
+    step_create_repo(sh, repo=repo, template_repo=template_repo)
+    result.steps_completed.append("create_repo")
 
     # Step 2 (token substitution) runs as its own script — see substitute.py
     # — invoked by provision-site.yml directly against the checked-out repo,

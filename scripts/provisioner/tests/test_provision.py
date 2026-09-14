@@ -14,6 +14,7 @@ import yaml
 from provisioner.provision import (
     ProvisionInputs,
     ProvisioningTicket,
+    TemplateCopyTimeout,
     derive_slug,
     generate_passphrase,
     provision_site,
@@ -111,51 +112,74 @@ def test_generate_passphrase_varies_across_calls():
 
 def test_step_create_repo_converges_when_already_exists():
     sh = FakeShell({("view", "existing/repo"): cp(returncode=0, stdout='{"name":"repo"}')})
-    ticket = step_create_repo(sh, repo="existing/repo", template_repo="org/tmpl")
-    assert ticket is None
+    step_create_repo(sh, repo="existing/repo", template_repo="org/tmpl")
     assert not any("create" in c for c in sh.calls)
 
 
-def test_step_create_repo_polls_until_branches_appear(monkeypatch):
-    """GitHub's --template copy is async: gh repo create returns before the
-    new repo has any commits. A clone right after create can race that job
-    and silently get an empty repo (observed live on run 34791251371).
-    step_create_repo must poll branches until non-empty before returning.
+class BranchesAfterNFakeShell(FakeShell):
+    """FakeShell whose `gh api .../branches` responds empty for the first
+    `empty_polls` calls, then non-empty forever after — models GitHub's
+    async template-copy job landing partway through a backoff schedule.
     """
-    monkeypatch.setattr("provisioner.provision._time.sleep", lambda *_: None)
-    state = {"n": 0}
 
-    class PollingFakeShell(FakeShell):
-        def _respond(self, argv):
-            self.calls.append(argv)
-            if "branches" in " ".join(argv):
-                state["n"] += 1
-                if state["n"] < 3:
-                    return cp(returncode=0, stdout="[]")
-                return cp(returncode=0, stdout='[{"name":"main"}]')
-            for pattern, resp in self.responses.items():
-                if all(p in argv for p in pattern):
-                    return resp
-            return self.default
+    def __init__(self, empty_polls: int, responses=None):
+        super().__init__(responses)
+        self.empty_polls = empty_polls
+        self.branch_calls = 0
 
-    sh = PollingFakeShell({("view", "org/new-repo"): cp(returncode=1)})
-    ticket = step_create_repo(sh, repo="org/new-repo", template_repo="org/tmpl", poll_interval_seconds=0)
-    assert ticket is None
-    assert state["n"] == 3
+    def _respond(self, argv):
+        self.calls.append(argv)
+        if "branches" in " ".join(argv):
+            self.branch_calls += 1
+            if self.branch_calls <= self.empty_polls:
+                return cp(returncode=0, stdout="[]")
+            return cp(returncode=0, stdout='[{"name":"main"}]')
+        for pattern, resp in self.responses.items():
+            if all(p in argv for p in pattern):
+                return resp
+        return self.default
 
 
-def test_step_create_repo_files_ticket_when_copy_never_lands(monkeypatch):
-    monkeypatch.setattr("provisioner.provision._time.sleep", lambda *_: None)
+def test_step_create_repo_backs_off_then_succeeds_once_copy_lands(monkeypatch):
+    """GitHub's --template copy is async: gh repo create returns before the
+    new repo has any commits, and the copy can legitimately take longer
+    than a short fixed window (observed live: run 34791251371 raced an
+    immediate clone into an empty repo; run 34791830298 then timed out on
+    a single fixed 20s window even though the copy was still in progress).
+    A template copy that looks empty for the first several polls and then
+    succeeds must produce a normal, successful step_create_repo call — no
+    exception, no ticket — once any poll in the backoff schedule sees
+    branches.
+    """
+    sleeps: list[float] = []
+    monkeypatch.setattr("provisioner.provision._time.sleep", sleeps.append)
+
+    sh = BranchesAfterNFakeShell(
+        empty_polls=4,  # succeeds on the 5th check, mid-schedule
+        responses={("view", "org/new-repo"): cp(returncode=1)},
+    )
+    step_create_repo(sh, repo="org/new-repo", template_repo="org/tmpl")
+
+    assert sh.branch_calls == 5
+    # Slept between polls using the real (non-zero) backoff schedule —
+    # proves this test exercises actual exponential backoff, not a stub.
+    assert len(sleeps) == 4
+    assert sleeps == [1, 2, 4, 8]
+
+
+def test_step_create_repo_raises_after_full_backoff_window_expires():
+    """Timing/races/slow APIs are never a human decision — on full timeout
+    this must raise (failing the run loudly), not return/file a ticket.
+    """
     sh = FakeShell({
         ("view", "org/stuck-repo"): cp(returncode=1),
         ("api",): cp(returncode=0, stdout="[]"),
     })
-    ticket = step_create_repo(
-        sh, repo="org/stuck-repo", template_repo="org/tmpl",
-        poll_attempts=3, poll_interval_seconds=0,
-    )
-    assert isinstance(ticket, ProvisioningTicket)
-    assert "org/stuck-repo" in ticket.title
+    with pytest.raises(TemplateCopyTimeout, match="org/stuck-repo"):
+        step_create_repo(
+            sh, repo="org/stuck-repo", template_repo="org/tmpl",
+            poll_schedule=(0, 0, 0),
+        )
 
 
 # --- step_ensure_fly_app -------------------------------------------------
@@ -318,10 +342,12 @@ def test_provision_site_is_idempotent_when_repo_already_exists(tmp_path: Path, m
 
 
 def test_provision_site_files_ticket_and_continues_when_fly_blocked(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("provisioner.provision._time.sleep", lambda *_: None)
     orgs_path = tmp_path / "organizations.yaml"
     orgs_path.write_text(yaml.safe_dump([]))
     sh = FakeShell(responses={
         ("repo", "view"): cp(returncode=1),
+        ("api",): cp(returncode=0, stdout='[{"name":"main"}]'),
         ("apps", "list"): cp(returncode=0, stdout="[]"),
         ("apps", "create"): cp(returncode=1, stderr="permission denied"),
         ("workflow", "run"): cp(returncode=0),
