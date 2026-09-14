@@ -12,6 +12,11 @@ on:
         required: false
         type: string
         default: ""
+      promote:
+        description: Also point the real domain at it (DNS + cert). Leave false to stand the site up on fly.dev only.
+        required: false
+        type: boolean
+        default: false
       dry_run:
         required: false
         type: boolean
@@ -25,6 +30,7 @@ jobs:
       domain: ${{ inputs.domain }}
       image_ref: registry.fly.io/oneshot-site-images:live
       dry_run: ${{ inputs.dry_run }}
+      promote: ${{ inputs.promote }}
     secrets:
       pr-app-id: ${{ secrets.PR_APP_ID }}
       pr-app-private-key: ${{ secrets.PR_APP_PRIVATE_KEY }}

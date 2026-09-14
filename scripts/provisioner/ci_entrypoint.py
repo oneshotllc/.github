@@ -33,6 +33,7 @@ from provision import (  # noqa: E402
     step_ensure_cert,
     step_ensure_dns_record,
     derive_fly_app,
+    ProvisioningError,
     step_ensure_fly_app,
     step_deploy_image,
     step_set_fly_secrets,
@@ -94,6 +95,8 @@ def main() -> int:
     cloudflare_token = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
     cloudflare_zone_id = os.environ.get("CLOUDFLARE_ZONE_ID", "").strip()
     dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+    # Promote is Brian's gate: DNS + cert only when explicitly asked.
+    promote = os.environ.get("PROMOTE", "").lower() == "true"
 
     slug = derive_slug_from_domain(domain)
     repo = f"oneshotmn/{slug}"
@@ -204,25 +207,22 @@ def main() -> int:
             need="Wire IMAGE_REF (the published site image tag) into provision-site.yml's env.",
         ))
 
-    if cloudflare_token and cloudflare_zone_id:
+    # PRODUCTION PROMOTE IS BRIAN'S GATE, NOT A PROVISIONING STEP.
+    # Provisioning stands the site up on its .fly.dev address only. Pointing
+    # the real customer domain at it is a separate, deliberate act - doing it
+    # here published an empty WordPress on a live domain before anyone asked.
+    if promote:
+        if not (cloudflare_token and cloudflare_zone_id):
+            raise ProvisioningError(
+                f"cannot promote {domain}: CLOUDFLARE_API_TOKEN / CLOUDFLARE_ZONE_ID "
+                f"were empty in the job environment"
+            )
         http = HttpClient("https://api.cloudflare.com/client/v4", cloudflare_token)
         zone_lookup = {_registrable_domain_local(domain): cloudflare_zone_id, domain: cloudflare_zone_id}
-        dns_ticket = step_ensure_dns_record(http, domain=domain, target=f"{fly_app}.fly.dev", zone_lookup=zone_lookup)
-        if dns_ticket:
-            tickets.append(dns_ticket)
-            file_ticket(sh, dns_ticket)
-
-        cert_ticket = step_ensure_cert(sh, fly_app=fly_app, domain=domain)
-        if cert_ticket:
-            tickets.append(cert_ticket)
-            file_ticket(sh, cert_ticket)
+        step_ensure_dns_record(http, domain=domain, target=f"{fly_app}.fly.dev", zone_lookup=zone_lookup)
+        step_ensure_cert(sh, fly_app=fly_app, domain=domain)
     else:
-        tickets.append(ProvisioningTicket(
-            title=f"No Cloudflare credentials to point {domain} at {fly_app}",
-            tried="step_ensure_dns_record with $CLOUDFLARE_API_TOKEN / $CLOUDFLARE_ZONE_ID",
-            hit="one or both env vars were empty in the provision-site.yml job environment",
-            need="Wire CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID into provision-site.yml's secrets/env.",
-        ))
+        print(f"[promote] skipped: {domain} left untouched; site is at https://{fly_app}.fly.dev/")
 
     if image_ref:
         reached, elapsed = poll_until_200(_http_status, f"https://{fly_app}.fly.dev/")

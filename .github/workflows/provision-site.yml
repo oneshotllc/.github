@@ -22,6 +22,11 @@ on:
         description: The organization/site name to provision, e.g. "Voices of Power".
         required: true
         type: string
+      promote:
+        description: Point the real domain at the site (DNS + cert). Provisioning leaves production alone unless this is true - promote is a deliberate act, not a side effect.
+        required: false
+        type: boolean
+        default: false
       image_ref:
         description: Prebuilt image the deploy step ships, e.g. registry.fly.io/oneshot-site-images:latest.
         required: false
@@ -128,6 +133,7 @@ jobs:
           DOMAIN: ${{ inputs.domain }}
           REGION: ${{ inputs.region }}
           DRY_RUN: ${{ inputs.dry_run }}
+          PROMOTE: ${{ inputs.promote }}
           # Deploy a PREBUILT image: image build time must never sit in the
           # provisioning path (publish-image.yml builds it once).
           IMAGE_REF: ${{ inputs.image_ref }}

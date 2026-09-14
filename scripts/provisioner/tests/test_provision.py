@@ -486,3 +486,17 @@ def test_deploy_passes_the_sites_own_fly_config():
                       config_path="/tmp/site/fly.toml")
     flat = " ".join(sh.calls[0])
     assert "--config /tmp/site/fly.toml" in flat
+
+
+def test_provisioning_does_not_touch_the_real_domain_by_default():
+    """Brian's rule: production promote is HIS gate. Provisioning stands the
+    site up on .fly.dev; pointing the customer domain at it is a separate,
+    deliberate act. Doing it automatically published an empty WordPress on a
+    live domain before he had asked for anything."""
+    import inspect
+    from provisioner import ci_entrypoint
+    src = inspect.getsource(ci_entrypoint)
+    assert "if promote:" in src, "DNS/cert must be gated behind an explicit promote flag"
+    dns_at = src.index("step_ensure_dns_record(http")
+    gate_at = src.index("if promote:")
+    assert gate_at < dns_at, "the DNS call must sit inside the promote gate"
