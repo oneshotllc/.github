@@ -92,11 +92,12 @@ def main() -> int:
     clone_dir = Path("/tmp") / f"provision-{slug}"
     if clone_dir.exists():
         subprocess.run(["rm", "-rf", str(clone_dir)])
-    clone_url = f"https://x-access-token:{os.environ['GH_TOKEN']}@github.com/{repo}.git"
+    token = os.environ["GH_TOKEN"]
+    clone_url = "https://x-access-token:" + token + "@github.com/" + repo + ".git"
     clone = subprocess.run(["git", "clone", clone_url, str(clone_dir)], capture_output=True, text=True)
     if clone.returncode != 0:
         print(clone.stderr, file=sys.stderr)
-        raise SystemExit(f"git clone of {repo} failed: {clone.stderr.strip()}")
+        raise SystemExit(f"git clone of {repo} failed: " + clone.stderr.strip())
     sub = subprocess.run(
         [
             sys.executable, str(Path(__file__).parent / "substitute.py"), str(clone_dir),
