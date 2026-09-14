@@ -338,7 +338,7 @@ def test_provision_site_full_run_reports_every_step(tmp_path: Path, monkeypatch)
 
     assert result.slug == "acme-corp"
     assert result.repo == "oneshotmn/acme-corp"
-    assert result.fly_app == "acme-corp"
+    assert result.fly_app == "acme-corp-oneshot-help"
     assert "create_repo" in result.steps_completed
     assert "ensure_fly_app" in result.steps_completed
     assert "register_organization" in result.steps_completed
