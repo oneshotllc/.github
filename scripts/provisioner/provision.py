@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import re
 import secrets as _secrets
+import tempfile as _tempfile
+import os as _os
 import subprocess
 import sys
 import time as _time
@@ -145,69 +147,60 @@ def step_create_repo(
     sh: Shell, *, repo: str, template_repo: str,
     poll_schedule: tuple[float, ...] = (1, 2, 4, 8, 15, 30, 30, 30, 30, 30),
 ) -> None:
-    """gh repo create --template only *starts* GitHub's template-copy job;
-    it returns before the new repo has any commits. A clone started right
-    after create races that async job and silently gets an empty
-    repository (observed live: run 34791251371's follow-on clone step
-    failed 'repository not found' on a repo gh had just reported as
-    created; run 34791830298 then showed a single 20s poll window is too
-    short — GitHub's copy can legitimately take longer). Poll the branch
-    list with exponential backoff (schedule sums to >=180s) until it is
-    non-empty (i.e. the copy landed a default branch with commits) before
-    handing back to the caller.
+    """Create `repo` and guarantee it has the template's content.
 
-    An existing repo may still be branchless (run 34791830298 died
-    mid-copy; every retry then returned early on "exists" and stranded
-    forever) — both the create and the already-exists paths fall through
-    to the same content wait.
+    GitHub's `--template` copy is an async server-side job and it is NOT
+    reliable: live runs 34791830298 and 34792691772 both left
+    oneshotmn/template-proof with a `main` ref and zero content, the second
+    after a full 180s of backoff polling. Waiting longer does not fix a job
+    that already rolled itself back.
 
-    Recreating a just-deleted repo under the SAME name is a further,
-    worse case (observed live: run 34792369730 — deleted then recreated
-    "template-proof" within seconds, template-copy never landed a branch
-    in a full 180s backoff; the identical create succeeded in under 20s
-    once given a 30s gap after the delete first). GitHub's template-copy
-    job for a freshly-freed name can stick indefinitely. Since
-    delete-then-restore-under-the-same-name is exactly Step 2 of the
-    acceptance test, that failure mode is handled here too: if still
-    empty after the full backoff, delete and recreate once more (nothing
-    is lost — it never had content) and poll a second time before
-    raising for real.
+    So the copy is not trusted as the source of content. The repo is created
+    empty and seeded deterministically by cloning the template and pushing
+    it. Same result, no async job, no race, and it converges: an existing
+    but empty repo (an earlier run that died mid-flight) gets seeded on the
+    next run instead of stranding provisioning forever.
     """
-    def _create_and_poll() -> bool:
-        for wait_seconds in poll_schedule:
-            branches = sh.gh("api", f"repos/{repo}/branches")
-            if branches.returncode == 0 and branches.stdout.strip() not in ("", "[]"):
-                return True
-            _time.sleep(wait_seconds)
-        branches = sh.gh("api", f"repos/{repo}/branches")
-        return branches.returncode == 0 and branches.stdout.strip() not in ("", "[]")
-
     exists = sh.gh("repo", "view", repo, "--json", "name")
     if exists.returncode != 0:
         sh.gh(
-            "repo", "create", repo, "--template", template_repo, "--private",
+            "repo", "create", repo, "--private",
             "--description", f"Provisioned by provision-site.yml from {template_repo}",
         )
 
-    if _create_and_poll():
-        return
+    if _has_content(sh, repo):
+        return  # converge: already seeded
 
-    # Stuck template-copy for this name — self-heal once: delete the empty
-    # repo (nothing is lost, it never got content) and recreate it fresh.
-    sh.gh("repo", "delete", repo, "--yes")
-    sh.gh(
-        "repo", "create", repo, "--template", template_repo, "--private",
-        "--description", f"Provisioned by provision-site.yml from {template_repo}",
-    )
-    if _create_and_poll():
-        return
+    _seed_from_template(sh, repo=repo, template_repo=template_repo)
 
-    total_wait = sum(poll_schedule)
-    raise TemplateCopyTimeout(
-        f"{repo}: GitHub's template-copy from {template_repo} produced no branches "
-        f"after two rounds of {total_wait:.0f}s backoff polling (including one "
-        f"delete+recreate self-heal). Retryable — re-run provisioning."
-    )
+    if not _has_content(sh, repo):
+        raise TemplateCopyTimeout(
+            f"{repo}: seeding from {template_repo} left the repo empty. "
+            f"Retryable - re-run; the step is idempotent."
+        )
+
+
+def _has_content(sh: Shell, repo: str) -> bool:
+    """A branch ref alone is not content: GitHub reports a `main` ref for a
+    repo whose template copy rolled back. Trust the tree, not the ref."""
+    listing = sh.gh("api", f"repos/{repo}/contents")
+    out = (listing.stdout or "").strip()
+    return listing.returncode == 0 and out not in ("", "[]") and '"message"' not in out[:40]
+
+
+def _seed_from_template(sh: Shell, *, repo: str, template_repo: str) -> None:
+    """Mirror the template's default branch into the new repo over https,
+    authenticated the only way this host is allowed to push."""
+    work = _tempfile.mkdtemp(prefix="seed-")
+    src = _os.path.join(work, "src")
+    sh.git("clone", "--depth", "1", f"https://github.com/{template_repo}.git", src)
+    sh.run(["rm", "-rf", _os.path.join(src, ".git")])
+    sh.git("init", "-q", "-b", "main", cwd=src)
+    sh.git("config", "user.email", "oneshot-pr-bot@users.noreply.github.com", cwd=src)
+    sh.git("config", "user.name", "oneshot-pr-bot", cwd=src)
+    sh.git("add", "-A", cwd=src)
+    sh.git("commit", "-q", "-m", f"Provision: seed from {template_repo}", cwd=src)
+    sh.git("push", "-q", "-f", f"https://github.com/{repo}.git", "HEAD:main", cwd=src)
 
 
 def step_ensure_fly_app(sh: Shell, *, fly_app: str, region: str, fly_org: str = "oneshot-llc") -> ProvisioningTicket | None:

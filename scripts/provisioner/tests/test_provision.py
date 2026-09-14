@@ -18,6 +18,7 @@ from provisioner.provision import (
     derive_slug,
     generate_passphrase,
     provision_site,
+    TemplateCopyTimeout,
     step_create_repo,
     step_ensure_fly_app,
     step_register_organization,
@@ -110,144 +111,83 @@ def test_generate_passphrase_varies_across_calls():
 # --- step_create_repo -----------------------------------------------------
 
 
-def test_step_create_repo_converges_when_already_exists():
+def _content(*names):
+    return cp(returncode=0, stdout="[" + ",".join(f'{{"name":"{n}"}}' for n in names) + "]")
+
+
+_EMPTY_REPO = cp(returncode=0, stdout='{"message":"This repository is empty.","status":"404"}')
+
+
+def test_step_create_repo_converges_when_already_seeded():
+    """Existing repo WITH content: no create, no seed, no work."""
     sh = FakeShell({
         ("view", "existing/repo"): cp(returncode=0, stdout='{"name":"repo"}'),
-        ("api",): cp(returncode=0, stdout='[{"name":"main"}]'),  # copy already landed
+        ("api",): _content("README.md"),
     })
     step_create_repo(sh, repo="existing/repo", template_repo="org/tmpl")
     assert not any("create" in c for c in sh.calls)
+    assert not any("clone" in c for c in sh.calls)
 
 
-class BranchesAfterNFakeShell(FakeShell):
-    """FakeShell whose `gh api .../branches` responds empty for the first
-    `empty_polls` calls, then non-empty forever after — models GitHub's
-    async template-copy job landing partway through a backoff schedule.
-    """
+def test_step_create_repo_seeds_a_new_repo_from_the_template():
+    """New repo: create empty, then seed by clone+push. The unreliable
+    --template flag must NOT be used (live runs 34791830298 / 34792691772
+    both produced a branch ref with zero content)."""
+    state = {"n": 0}
 
-    def __init__(self, empty_polls: int, responses=None):
-        super().__init__(responses)
-        self.empty_polls = empty_polls
-        self.branch_calls = 0
-
-    def _respond(self, argv):
-        self.calls.append(argv)
-        if "branches" in " ".join(argv):
-            self.branch_calls += 1
-            if self.branch_calls <= self.empty_polls:
-                return cp(returncode=0, stdout="[]")
-            return cp(returncode=0, stdout='[{"name":"main"}]')
-        for pattern, resp in self.responses.items():
-            if all(p in argv for p in pattern):
-                return resp
-        return self.default
-
-
-def test_step_create_repo_backs_off_then_succeeds_once_copy_lands(monkeypatch):
-    """GitHub's --template copy is async: gh repo create returns before the
-    new repo has any commits, and the copy can legitimately take longer
-    than a short fixed window (observed live: run 34791251371 raced an
-    immediate clone into an empty repo; run 34791830298 then timed out on
-    a single fixed 20s window even though the copy was still in progress).
-    A template copy that looks empty for the first several polls and then
-    succeeds must produce a normal, successful step_create_repo call — no
-    exception, no ticket — once any poll in the backoff schedule sees
-    branches.
-    """
-    sleeps: list[float] = []
-    monkeypatch.setattr("provisioner.provision._time.sleep", sleeps.append)
-
-    sh = BranchesAfterNFakeShell(
-        empty_polls=4,  # succeeds on the 5th check, mid-schedule
-        responses={("view", "org/new-repo"): cp(returncode=1)},
-    )
-    step_create_repo(sh, repo="org/new-repo", template_repo="org/tmpl")
-
-    assert sh.branch_calls == 5
-    # Slept between polls using the real (non-zero) backoff schedule —
-    # proves this test exercises actual exponential backoff, not a stub.
-    assert len(sleeps) == 4
-    assert sleeps == [1, 2, 4, 8]
-
-
-def test_step_create_repo_self_heals_by_deleting_and_recreating_stuck_name(monkeypatch):
-    """Deleting then recreating a repo under the SAME name is a distinct,
-    worse failure mode than a plain slow copy (observed live: run
-    34792369730 — deleted then immediately recreated "template-proof",
-    template-copy never landed a branch in a full 180s backoff, but an
-    identical create succeeded in under 20s once given a cooldown gap).
-    This is exactly Step 2 of the acceptance test (delete, then restore
-    under the same org_name), so step_create_repo must self-heal it: if
-    the first full backoff round never sees branches, delete the
-    still-empty repo and try once more before giving up.
-    """
-    monkeypatch.setattr("provisioner.provision._time.sleep", lambda *_: None)
-    state = {"branch_calls_this_round": 0, "creates": 0, "deletes": 0}
-
-    class StuckThenHealsFakeShell(FakeShell):
+    class SeedingShell(FakeShell):
         def _respond(self, argv):
             self.calls.append(argv)
             joined = " ".join(argv)
-            if "create" in argv and "repo" in argv:
-                state["creates"] += 1
-                state["branch_calls_this_round"] = 0
-                return cp(returncode=0)
-            if "delete" in argv:
-                state["deletes"] += 1
-                return cp(returncode=0)
-            if "branches" in joined:
-                state["branch_calls_this_round"] += 1
-                # First create's round: always empty. Second create's
-                # round: succeeds immediately.
-                if state["creates"] >= 2:
-                    return cp(returncode=0, stdout='[{"name":"main"}]')
-                return cp(returncode=0, stdout="[]")
+            if "contents" in joined:
+                state["n"] += 1
+                return _EMPTY_REPO if state["n"] == 1 else _content("README.md")
             for pattern, resp in self.responses.items():
                 if all(p in argv for p in pattern):
                     return resp
             return self.default
 
-    sh = StuckThenHealsFakeShell({("view", "org/stuck-name"): cp(returncode=1)})
-    step_create_repo(
-        sh, repo="org/stuck-name", template_repo="org/tmpl",
-        poll_schedule=(0, 0),
-    )
-
-    assert state["creates"] == 2, "expected exactly one self-heal recreate"
-    assert state["deletes"] == 1, "expected exactly one delete before the recreate"
+    sh = SeedingShell({("view", "org/new-repo"): cp(returncode=1)})
+    step_create_repo(sh, repo="org/new-repo", template_repo="org/tmpl")
+    flat = [" ".join(c) for c in sh.calls]
+    assert any("repo create" in f or ("create" in f and "org/new-repo" in f) for f in flat)
+    assert not any("--template" in f for f in flat), "must not rely on GitHub's async template copy"
+    assert any("clone" in f for f in flat) and any("push" in f for f in flat)
 
 
-def test_step_create_repo_raises_after_self_heal_also_fails():
-    """If even the delete+recreate self-heal never lands branches, this is
-    a real, unrecoverable-for-now GitHub-side stall — still not a human
-    decision, so it must raise (fail the run loudly), never a ticket.
-    """
+def test_step_create_repo_seeds_an_existing_but_empty_repo():
+    """Regression, live run 34791830298: an earlier run created the repo and
+    died before content landed. Returning early on 'repo exists' stranded
+    every retry on a contentless repo and produced a bogus human ticket."""
+    state = {"n": 0}
+
+    class SeedingShell(FakeShell):
+        def _respond(self, argv):
+            self.calls.append(argv)
+            if "contents" in " ".join(argv):
+                state["n"] += 1
+                return _EMPTY_REPO if state["n"] == 1 else _content("README.md")
+            for pattern, resp in self.responses.items():
+                if all(p in argv for p in pattern):
+                    return resp
+            return self.default
+
+    sh = SeedingShell({("view", "org/empty-repo"): cp(returncode=0, stdout='{"name":"empty-repo"}')})
+    step_create_repo(sh, repo="org/empty-repo", template_repo="org/tmpl")
+    flat = [" ".join(c) for c in sh.calls]
+    assert not any("repo create" in f for f in flat), "must not recreate an existing repo"
+    assert any("push" in f for f in flat), "must seed the empty repo"
+
+
+def test_step_create_repo_raises_when_seeding_produces_nothing():
+    """A repo still empty after seeding is a loud RUN failure, never a
+    ticket: timing and API problems are code, not human decisions."""
     sh = FakeShell({
         ("view", "org/stuck-repo"): cp(returncode=1),
-        ("api",): cp(returncode=0, stdout="[]"),
+        ("api",): _EMPTY_REPO,
     })
-    with pytest.raises(TemplateCopyTimeout, match="org/stuck-repo"):
-        step_create_repo(
-            sh, repo="org/stuck-repo", template_repo="org/tmpl",
-            poll_schedule=(0, 0),
-        )
-    delete_calls = [c for c in sh.calls if "delete" in c]
-    assert len(delete_calls) == 1, "expected exactly one self-heal delete attempt"
-
-
-def test_step_create_repo_raises_after_full_backoff_window_expires():
-    """Timing/races/slow APIs are never a human decision — on full timeout
-    this must raise (failing the run loudly), not return/file a ticket.
-    """
-    sh = FakeShell({
-        ("view", "org/stuck-repo"): cp(returncode=1),
-        ("api",): cp(returncode=0, stdout="[]"),
-    })
-    with pytest.raises(TemplateCopyTimeout, match="org/stuck-repo"):
-        step_create_repo(
-            sh, repo="org/stuck-repo", template_repo="org/tmpl",
-            poll_schedule=(0, 0, 0),
-        )
+    with pytest.raises(TemplateCopyTimeout):
+        step_create_repo(sh, repo="org/stuck-repo", template_repo="org/tmpl")
 
 
 # --- step_ensure_fly_app -------------------------------------------------
@@ -437,27 +377,3 @@ def test_provision_site_files_ticket_and_continues_when_fly_blocked(tmp_path: Pa
     assert "register_organization" in result.steps_completed
     assert "trigger_preview" in result.steps_completed
 
-
-def test_step_create_repo_waits_when_existing_repo_is_still_empty(monkeypatch):
-    """Regression, live run 34791830298: an earlier run created the repo then
-    died while GitHub's template copy was still in flight. step_create_repo
-    returned early on "repo exists", so every retry stranded on a branchless
-    repo and the provisioner ticketed a human instead of simply waiting."""
-    monkeypatch.setattr("provisioner.provision._time.sleep", lambda *_: None)
-    state = {"n": 0}
-
-    class SlowCopyShell(FakeShell):
-        def _respond(self, argv):
-            self.calls.append(argv)
-            if "branches" in " ".join(argv):
-                state["n"] += 1
-                return cp(returncode=0, stdout="[]" if state["n"] < 3 else '[{"name":"main"}]')
-            for pattern, resp in self.responses.items():
-                if all(p in argv for p in pattern):
-                    return resp
-            return self.default
-
-    sh = SlowCopyShell({("view", "org/empty-repo"): cp(returncode=0, stdout='{"name":"empty-repo"}')})
-    step_create_repo(sh, repo="org/empty-repo", template_repo="org/tmpl")
-    assert state["n"] == 3, "must keep polling an existing-but-empty repo"
-    assert not any("create" in c for c in sh.calls), "must not recreate an existing repo"
