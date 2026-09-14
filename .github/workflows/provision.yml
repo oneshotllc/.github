@@ -3,11 +3,12 @@ name: Provision (manual trigger)
 on:
   workflow_dispatch:
     inputs:
-      org_name:
-        description: Organization/site name to provision.
+      domain:
+        description: The site's domain, e.g. oneshot.help. This alone is enough - slug, repo, Fly app, DNS and cert are all derived from it.
         required: true
         type: string
-      domain:
+      org_name:
+        description: Optional display name. Derived from the domain when omitted.
         required: false
         type: string
         default: ""
@@ -22,6 +23,7 @@ jobs:
     with:
       org_name: ${{ inputs.org_name }}
       domain: ${{ inputs.domain }}
+      image_ref: registry.fly.io/oneshot-site-images:live
       dry_run: ${{ inputs.dry_run }}
     secrets:
       pr-app-id: ${{ secrets.PR_APP_ID }}
