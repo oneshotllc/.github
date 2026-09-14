@@ -153,7 +153,16 @@ class Shell:
     """
 
     def run(self, argv: list[str], check: bool = False) -> subprocess.CompletedProcess:
-        return subprocess.run(argv, check=check, capture_output=True, text=True)
+        proc = subprocess.run(argv, check=check, capture_output=True, text=True)
+        # Every external command is captured, so without this a failing step
+        # is invisible in the run log and the provisioner can only guess at
+        # the cause (live: three runs blamed a Fly token for three different
+        # non-token bugs). Log the command and its result, never the values.
+        if argv and argv[0] in ("flyctl", "fly"):
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            print(f"[cmd] {' '.join(argv[:4])} -> rc={proc.returncode}"
+                  + (f" | {tail[-1][:180]}" if tail else ""), flush=True)
+        return proc
 
     def gh(self, *args: str, check: bool = False) -> subprocess.CompletedProcess:
         return self.run([*ONESHOT_PR, "gh", *args], check=check)
