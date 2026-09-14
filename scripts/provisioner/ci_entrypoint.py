@@ -86,7 +86,12 @@ def main() -> int:
         _emit_outputs(repo=repo, slug=slug, fly_app=fly_app, tickets_filed=0)
         return 0
 
-    step_create_repo(sh, repo=repo, template_repo="oneshotmn/site-template")
+    create_ticket = step_create_repo(sh, repo=repo, template_repo="oneshotmn/site-template")
+    if create_ticket:
+        tickets.append(create_ticket)
+        file_ticket(sh, create_ticket)
+        _emit_outputs(repo=repo, slug=slug, fly_app=fly_app, tickets_filed=len(tickets))
+        raise SystemExit(f"create_repo did not converge for {repo}: {create_ticket.hit}")
 
     # Token substitution: clone, replace __TOKEN__s, commit + push idempotently.
     clone_dir = Path("/tmp") / f"provision-{slug}"
