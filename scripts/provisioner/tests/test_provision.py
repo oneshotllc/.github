@@ -459,3 +459,27 @@ def test_app_token_is_minted_with_org_scope():
     text = wf.read_text()
     mint = text.split("create-github-app-token")[1].split("- name:")[0]
     assert "owner:" in mint, "app token must be minted with owner: for org-wide scope"
+
+
+def test_deploy_does_not_pass_region_flag():
+    """Regression, live run 34798261207: step_deploy_image passed --region to
+    `flyctl deploy`, which has no such flag. It died with 'unknown flag:
+    --region' and the provisioner mis-reported it as a missing Fly token."""
+    import inspect
+    from provisioner.provision import step_deploy_image
+    src = inspect.getsource(step_deploy_image)
+    assert '"--region"' not in src, "flyctl deploy has no --region flag"
+
+
+def test_deploy_failure_raises_instead_of_ticketing():
+    """A failed deploy is code (wrong command, image or app), never a human
+    decision. Only a credential that cannot exist here may become a ticket."""
+    from provisioner.provision import ProvisioningError, step_deploy_image
+
+    class FailingShell(FakeShell):
+        def run(self, argv, check=False):
+            self.calls.append(argv)
+            return cp(returncode=1, stderr="Error: unknown flag: --region")
+
+    with pytest.raises(ProvisioningError):
+        step_deploy_image(FailingShell({}), fly_app="app", image_ref="img:live", region="ord")

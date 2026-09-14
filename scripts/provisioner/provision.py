@@ -168,6 +168,10 @@ class Shell:
 # ---------------------------------------------------------------------------
 
 
+class ProvisioningError(RuntimeError):
+    """A run-level failure: loud, retryable, never a human ticket."""
+
+
 class TemplateCopyTimeout(RuntimeError):
     """Raised when GitHub's async --template copy job never lands a branch
     within the backoff window. This is a hard run failure, not a
@@ -306,6 +310,11 @@ def step_set_fly_secrets(
         input=payload, capture_output=True, text=True,
     )
     if proc.returncode != 0:
+        raise ProvisioningError(
+            f"setting Fly secrets on {fly_app} failed: "
+            + (proc.stderr or "non-zero exit").strip()[:400]
+        )
+    if False:
         return ProvisioningTicket(
             title=f"Cannot set Fly secrets on {fly_app}",
             tried=f"flyctl secrets import --app {fly_app} --stage",
@@ -324,16 +333,19 @@ def step_deploy_image(
     in the provisioning path). The image is built and pushed once by
     publish-image.yml; this step only ever references that existing tag.
     """
+    # NOTE: `flyctl deploy` has no --region flag (live run 34798261207 died
+    # on "unknown flag: --region" and mis-reported it as a token problem).
+    # Region belongs to the app/volume, which step_ensure_fly_app already set.
     deployed = sh.run([
         "flyctl", "deploy", "--app", fly_app, "--image", image_ref,
-        "--remote-only", "--strategy", "immediate", "--region", region,
+        "--strategy", "immediate", "--yes",
     ])
     if deployed.returncode != 0:
-        return ProvisioningTicket(
-            title=f"Cannot deploy {image_ref} to {fly_app}",
-            tried=f"flyctl deploy --app {fly_app} --image {image_ref} --remote-only",
-            hit=(deployed.stderr or deployed.stdout or "non-zero exit").strip()[:500],
-            need="A Fly API token with deploy access to this app.",
+        # A failed deploy is a RUN failure - the command, the image or the
+        # app is wrong, and all three are code. Never a human ticket.
+        raise ProvisioningError(
+            f"deploy of {image_ref} to {fly_app} failed: "
+            + (deployed.stderr or deployed.stdout or "non-zero exit").strip()[:500]
         )
     return None
 
@@ -405,11 +417,10 @@ def step_ensure_cert(sh: Shell, *, fly_app: str, domain: str) -> ProvisioningTic
     added = sh.run(["flyctl", "certs", "add", domain, "--app", fly_app])
     stderr = (added.stderr or "").lower()
     if added.returncode != 0 and "already" not in stderr and "exist" not in stderr:
-        return ProvisioningTicket(
-            title=f"Cannot add cert for {domain} on {fly_app}",
-            tried=f"flyctl certs add {domain} --app {fly_app}",
-            hit=(added.stderr or "non-zero exit").strip(),
-            need="A Fly API token with cert-management access to this app.",
+        # Cert failures are code/config, not a human decision.
+        raise ProvisioningError(
+            f"adding cert for {domain} on {fly_app} failed: "
+            + (added.stderr or "non-zero exit").strip()[:400]
         )
     return None
 
