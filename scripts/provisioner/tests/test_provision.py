@@ -170,6 +170,71 @@ def test_step_create_repo_backs_off_then_succeeds_once_copy_lands(monkeypatch):
     assert sleeps == [1, 2, 4, 8]
 
 
+def test_step_create_repo_self_heals_by_deleting_and_recreating_stuck_name(monkeypatch):
+    """Deleting then recreating a repo under the SAME name is a distinct,
+    worse failure mode than a plain slow copy (observed live: run
+    34792369730 — deleted then immediately recreated "template-proof",
+    template-copy never landed a branch in a full 180s backoff, but an
+    identical create succeeded in under 20s once given a cooldown gap).
+    This is exactly Step 2 of the acceptance test (delete, then restore
+    under the same org_name), so step_create_repo must self-heal it: if
+    the first full backoff round never sees branches, delete the
+    still-empty repo and try once more before giving up.
+    """
+    monkeypatch.setattr("provisioner.provision._time.sleep", lambda *_: None)
+    state = {"branch_calls_this_round": 0, "creates": 0, "deletes": 0}
+
+    class StuckThenHealsFakeShell(FakeShell):
+        def _respond(self, argv):
+            self.calls.append(argv)
+            joined = " ".join(argv)
+            if "create" in argv and "repo" in argv:
+                state["creates"] += 1
+                state["branch_calls_this_round"] = 0
+                return cp(returncode=0)
+            if "delete" in argv:
+                state["deletes"] += 1
+                return cp(returncode=0)
+            if "branches" in joined:
+                state["branch_calls_this_round"] += 1
+                # First create's round: always empty. Second create's
+                # round: succeeds immediately.
+                if state["creates"] >= 2:
+                    return cp(returncode=0, stdout='[{"name":"main"}]')
+                return cp(returncode=0, stdout="[]")
+            for pattern, resp in self.responses.items():
+                if all(p in argv for p in pattern):
+                    return resp
+            return self.default
+
+    sh = StuckThenHealsFakeShell({("view", "org/stuck-name"): cp(returncode=1)})
+    step_create_repo(
+        sh, repo="org/stuck-name", template_repo="org/tmpl",
+        poll_schedule=(0, 0),
+    )
+
+    assert state["creates"] == 2, "expected exactly one self-heal recreate"
+    assert state["deletes"] == 1, "expected exactly one delete before the recreate"
+
+
+def test_step_create_repo_raises_after_self_heal_also_fails():
+    """If even the delete+recreate self-heal never lands branches, this is
+    a real, unrecoverable-for-now GitHub-side stall — still not a human
+    decision, so it must raise (fail the run loudly), never a ticket.
+    """
+    sh = FakeShell({
+        ("view", "org/stuck-repo"): cp(returncode=1),
+        ("api",): cp(returncode=0, stdout="[]"),
+    })
+    with pytest.raises(TemplateCopyTimeout, match="org/stuck-repo"):
+        step_create_repo(
+            sh, repo="org/stuck-repo", template_repo="org/tmpl",
+            poll_schedule=(0, 0),
+        )
+    delete_calls = [c for c in sh.calls if "delete" in c]
+    assert len(delete_calls) == 1, "expected exactly one self-heal delete attempt"
+
+
 def test_step_create_repo_raises_after_full_backoff_window_expires():
     """Timing/races/slow APIs are never a human decision — on full timeout
     this must raise (failing the run loudly), not return/file a ticket.

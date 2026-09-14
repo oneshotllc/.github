@@ -154,39 +154,59 @@ def step_create_repo(
     short — GitHub's copy can legitimately take longer). Poll the branch
     list with exponential backoff (schedule sums to >=180s) until it is
     non-empty (i.e. the copy landed a default branch with commits) before
-    handing back to the caller. This is a timing issue, not a missing
-    credential or a decision for a human — so on full timeout it raises
-    and fails the run loudly instead of filing a ticket.
+    handing back to the caller.
+
+    An existing repo may still be branchless (run 34791830298 died
+    mid-copy; every retry then returned early on "exists" and stranded
+    forever) — both the create and the already-exists paths fall through
+    to the same content wait.
+
+    Recreating a just-deleted repo under the SAME name is a further,
+    worse case (observed live: run 34792369730 — deleted then recreated
+    "template-proof" within seconds, template-copy never landed a branch
+    in a full 180s backoff; the identical create succeeded in under 20s
+    once given a 30s gap after the delete first). GitHub's template-copy
+    job for a freshly-freed name can stick indefinitely. Since
+    delete-then-restore-under-the-same-name is exactly Step 2 of the
+    acceptance test, that failure mode is handled here too: if still
+    empty after the full backoff, delete and recreate once more (nothing
+    is lost — it never had content) and poll a second time before
+    raising for real.
     """
+    def _create_and_poll() -> bool:
+        for wait_seconds in poll_schedule:
+            branches = sh.gh("api", f"repos/{repo}/branches")
+            if branches.returncode == 0 and branches.stdout.strip() not in ("", "[]"):
+                return True
+            _time.sleep(wait_seconds)
+        branches = sh.gh("api", f"repos/{repo}/branches")
+        return branches.returncode == 0 and branches.stdout.strip() not in ("", "[]")
+
     exists = sh.gh("repo", "view", repo, "--json", "name")
-    if exists.returncode == 0:
-        # Converge, but do NOT assume "exists" implies "has content": an
-        # earlier run can create the repo and die while GitHub's async
-        # template copy is still in flight (live: run 34791830298 left
-        # oneshotmn/template-proof branchless, and every retry returned
-        # here and stranded forever). Fall through to the same wait.
-        pass
-    else:
+    if exists.returncode != 0:
         sh.gh(
             "repo", "create", repo, "--template", template_repo, "--private",
             "--description", f"Provisioned by provision-site.yml from {template_repo}",
         )
 
-    for wait_seconds in poll_schedule:
-        branches = sh.gh("api", f"repos/{repo}/branches")
-        if branches.returncode == 0 and branches.stdout.strip() not in ("", "[]"):
-            return
-        _time.sleep(wait_seconds)
+    if _create_and_poll():
+        return
 
-    # One last check after the final sleep before giving up.
-    branches = sh.gh("api", f"repos/{repo}/branches")
-    if branches.returncode == 0 and branches.stdout.strip() not in ("", "[]"):
+    # Stuck template-copy for this name — self-heal once: delete the empty
+    # repo (nothing is lost, it never got content) and recreate it fresh.
+    sh.gh("repo", "delete", repo, "--yes")
+    sh.gh(
+        "repo", "create", repo, "--template", template_repo, "--private",
+        "--description", f"Provisioned by provision-site.yml from {template_repo}",
+    )
+    if _create_and_poll():
         return
 
     total_wait = sum(poll_schedule)
     raise TemplateCopyTimeout(
         f"{repo}: GitHub's template-copy from {template_repo} produced no branches "
-        f"after {total_wait:.0f}s of backoff polling. Retryable — re-run provisioning."
+        f"after two rounds of {total_wait:.0f}s backoff polling (including one "
+        f"delete+recreate self-heal). Retryable — re-run provisioning."
     )
 
 
