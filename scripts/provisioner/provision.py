@@ -168,6 +168,17 @@ class Shell:
 # ---------------------------------------------------------------------------
 
 
+def _step_err(scope) -> str:
+    """Best-effort stderr from whichever subprocess result the step used, so
+    a failure names its real cause instead of guessing at a missing token."""
+    for key in ("created", "proc", "added", "resp", "result", "deployed", "listed", "out"):
+        r = scope.get(key)
+        text = getattr(r, "stderr", None) or getattr(r, "stdout", None)
+        if text:
+            return str(text).strip()[:400]
+    return "non-zero exit"
+
+
 class ProvisioningError(RuntimeError):
     """A run-level failure: loud, retryable, never a human ticket."""
 
@@ -261,11 +272,8 @@ def step_ensure_fly_app(sh: Shell, *, fly_app: str, region: str, fly_org: str = 
         created = sh.run(["flyctl", "apps", "create", fly_app, "--org", fly_org])
         stderr = (created.stderr or "").lower()
         if created.returncode != 0 and "already" not in stderr and "taken" not in stderr:
-            return ProvisioningTicket(
-                title=f"Cannot create Fly app {fly_app}",
-                tried=f"flyctl apps create {fly_app} --org {fly_org}",
-                hit=(created.stderr or "non-zero exit, no stderr").strip(),
-                need="An account-scoped Fly token or org access for this app name.",
+            raise ProvisioningError(
+                f"Cannot create Fly app {fly_app}: " + (_step_err(locals()))
             )
     step_ensure_volume(sh, fly_app=fly_app, region=region, volume_name="wp_uploads")
     return None
@@ -315,11 +323,8 @@ def step_set_fly_secrets(
             + (proc.stderr or "non-zero exit").strip()[:400]
         )
     if False:
-        return ProvisioningTicket(
-            title=f"Cannot set Fly secrets on {fly_app}",
-            tried=f"flyctl secrets import --app {fly_app} --stage",
-            hit=(proc.stderr or "non-zero exit").strip(),
-            need="A Fly API token with write access to this app's secrets.",
+        raise ProvisioningError(
+            f"Cannot set Fly secrets on {fly_app}: " + (_step_err(locals()))
         )
     return None
 
@@ -367,19 +372,13 @@ def step_ensure_dns_record(
     """
     zone_id = zone_lookup.get(domain) or zone_lookup.get(_registrable_domain(domain))
     if not zone_id:
-        return ProvisioningTicket(
-            title=f"No Cloudflare zone ID known for {domain}",
-            tried="scripts/provisioner look up zone_lookup[domain]",
-            hit=f"{domain} is not a key in the configured zone lookup",
-            need="Add this domain's Cloudflare zone ID to the provisioner's zone lookup.",
+        raise ProvisioningError(
+            f"No Cloudflare zone ID known for {domain}: " + (_step_err(locals()))
         )
     existing = http.get(f"/zones/{zone_id}/dns_records", params={"name": domain, "type": "CNAME"})
     if not existing.get("success"):
-        return ProvisioningTicket(
-            title=f"Cannot read DNS records for {domain}",
-            tried=f"GET /zones/{zone_id}/dns_records?name={domain}",
-            hit=json.dumps(existing.get("errors", []))[:300],
-            need="A Cloudflare API token with dns_records:read on this zone.",
+        raise ProvisioningError(
+            f"Cannot read DNS records for {domain}: " + (_step_err(locals()))
         )
     records = existing.get("result") or []
     body = {"type": "CNAME", "name": domain, "content": target, "proxied": False, "ttl": 60}
@@ -391,11 +390,8 @@ def step_ensure_dns_record(
     else:
         result = http.post(f"/zones/{zone_id}/dns_records", json=body)
     if not result.get("success"):
-        return ProvisioningTicket(
-            title=f"Cannot write DNS record for {domain}",
-            tried=f"{'PATCH' if records else 'POST'} /zones/{zone_id}/dns_records",
-            hit=json.dumps(result.get("errors", []))[:300],
-            need="A Cloudflare API token with dns_records:edit on this zone.",
+        raise ProvisioningError(
+            f"Cannot write DNS record for {domain}: " + (_step_err(locals()))
         )
     return None
 
@@ -515,11 +511,8 @@ def step_set_repo_secrets(sh: Shell, *, repo: str, secret_names_and_paths: dict[
         if proc.returncode != 0:
             missing.append(name)
     if missing:
-        return ProvisioningTicket(
-            title=f"Cannot set repo secret(s) {', '.join(missing)} on {repo}",
-            tried=f"gh secret set {{{', '.join(missing)}}} --repo {repo}",
-            hit="source credential file missing or gh secret set failed",
-            need="The real credential value(s) for the missing secret(s).",
+        raise ProvisioningError(
+            f"Cannot set repo secret(s) {', '.join(missing)} on {repo}: " + (_step_err(locals()))
         )
     return None
 

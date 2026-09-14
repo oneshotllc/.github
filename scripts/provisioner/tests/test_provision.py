@@ -212,18 +212,6 @@ def test_ensure_fly_app_converges_when_already_exists():
     create_calls = [c for c in sh.calls if "create" in c and "apps" in c]
     assert not create_calls, "must not attempt to create an app that already exists"
 
-
-def test_ensure_fly_app_files_ticket_on_real_failure():
-    sh = FakeShell(responses={
-        ("apps", "list"): cp(returncode=0, stdout="[]"),
-        ("apps", "create"): cp(returncode=1, stderr="permission denied"),
-    })
-    ticket = step_ensure_fly_app(sh, fly_app="acme", region="ord")
-    assert isinstance(ticket, ProvisioningTicket)
-    assert "permission denied" in ticket.hit
-    assert ticket.assignee == "bwoestman"
-
-
 def test_ensure_fly_app_treats_already_taken_as_converged_not_a_ticket():
     sh = FakeShell(responses={
         ("apps", "list"): cp(returncode=0, stdout="[]"),
@@ -322,15 +310,6 @@ def test_register_organization_preserves_existing_repos(tmp_path: Path):
 
 # --- step_set_repo_secrets ------------------------------------------------
 
-
-def test_set_repo_secrets_files_ticket_when_source_missing(tmp_path: Path):
-    sh = FakeShell()
-    missing_path = tmp_path / "does-not-exist"
-    ticket = step_set_repo_secrets(sh, repo="oneshotmn/acme", secret_names_and_paths={"X": str(missing_path)})
-    assert isinstance(ticket, ProvisioningTicket)
-    assert "X" in ticket.title
-
-
 def test_set_repo_secrets_succeeds_when_source_exists_and_gh_succeeds(tmp_path: Path, monkeypatch):
     secret_file = tmp_path / "secret"
     secret_file.write_text("shh")
@@ -405,36 +384,6 @@ def test_provision_site_is_idempotent_when_repo_already_exists(tmp_path: Path, m
     assert not fly_create_calls, "must not attempt to recreate an existing Fly app"
     assert "create_repo" in result.steps_completed  # step still reports converged
 
-
-def test_provision_site_files_ticket_and_continues_when_fly_blocked(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("provisioner.provision._time.sleep", lambda *_: None)
-    orgs_path = tmp_path / "organizations.yaml"
-    orgs_path.write_text(yaml.safe_dump([]))
-    sh = FakeShell(responses={
-        ("repo", "view"): cp(returncode=1),
-        ("api",): cp(returncode=0, stdout='[{"name":"main"}]'),
-        ("apps", "list"): cp(returncode=0, stdout="[]"),
-        ("apps", "create"): cp(returncode=1, stderr="permission denied"),
-        ("workflow", "run"): cp(returncode=0),
-    })
-
-    class FakeCompleted:
-        returncode = 0
-        stderr = ""
-
-    monkeypatch.setattr("subprocess.run", lambda *a, **k: FakeCompleted())
-
-    result = provision_site(
-        ProvisionInputs(domain="acme-corp.oneshot.help", org_name="Acme Corp"), sh,
-        organizations_path=orgs_path, secret_sources={}, skip_deploy=True,
-    )
-
-    assert any("Fly app" in t.title for t in result.tickets)
-    # Provisioning must continue past the blocked step:
-    assert "register_organization" in result.steps_completed
-
-
-
 def test_cishell_exposes_git_for_seeding():
     """Regression, live run 34793088841: _seed_from_template called sh.git()
     but CIShell only had run/gh, so every real provision died with
@@ -483,3 +432,22 @@ def test_deploy_failure_raises_instead_of_ticketing():
 
     with pytest.raises(ProvisioningError):
         step_deploy_image(FailingShell({}), fly_app="app", image_ref="img:live", region="ord")
+
+
+def test_infra_steps_raise_instead_of_ticketing():
+    """Brian's rule: only a credential that cannot exist on this host may
+    become a ticket. Infrastructure failures - app create, secrets, DNS -
+    are code or config, so they must fail the RUN loudly.
+
+    Live examples that wrongly reached Brian: #13/#14/#15 (a nonexistent
+    --region flag reported as a missing Fly token) and #16 (an org-scoped
+    token I had swapped in, reported as missing org access)."""
+    import inspect
+    from provisioner import provision
+
+    for name in ("step_ensure_fly_app", "step_set_fly_secrets",
+                 "step_ensure_dns_record", "step_set_repo_secrets"):
+        src = inspect.getsource(getattr(provision, name))
+        assert "return ProvisioningTicket(" not in src, (
+            f"{name} must raise ProvisioningError, not file a ticket"
+        )
