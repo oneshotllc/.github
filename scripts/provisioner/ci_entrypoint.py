@@ -12,6 +12,7 @@ constraint, not a design shortcut — see BRIEF-provisioner.md step 2's
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -44,6 +45,18 @@ class CIShell:
 
     def gh(self, *args: str, check: bool = False) -> subprocess.CompletedProcess:
         return self.run(["gh", *args], check=check)
+
+    def git(self, *args: str, cwd: str | None = None, check: bool = False) -> subprocess.CompletedProcess:
+        """Seeding clones and pushes over https. In CI the app token in
+        GH_TOKEN is the only credential, so it is injected per-call via an
+        ephemeral header rather than written into any URL or config (it must
+        never reach a log or the pushed repo)."""
+        token = os.environ.get("GH_TOKEN", "")
+        argv = ["git"]
+        if token:
+            basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+            argv += ["-c", f"http.https://github.com/.extraheader=Authorization: Basic {basic}"]
+        return subprocess.run([*argv, *args], check=check, capture_output=True, text=True, cwd=cwd)
 
 
 def write_secret_from_env(repo: str, secret_name: str, env_var: str) -> ProvisioningTicket | None:

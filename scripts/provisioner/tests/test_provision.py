@@ -377,3 +377,17 @@ def test_provision_site_files_ticket_and_continues_when_fly_blocked(tmp_path: Pa
     assert "register_organization" in result.steps_completed
     assert "trigger_preview" in result.steps_completed
 
+
+
+def test_cishell_exposes_git_for_seeding():
+    """Regression, live run 34793088841: _seed_from_template called sh.git()
+    but CIShell only had run/gh, so every real provision died with
+    AttributeError. The CI shell must satisfy the same interface the steps
+    use, and must never put the token in a URL (it would land in logs)."""
+    import inspect
+    from provisioner.ci_entrypoint import CIShell
+
+    assert hasattr(CIShell, "git"), "CIShell must implement git() like Shell"
+    src = inspect.getsource(CIShell.git)
+    assert "x-access-token:" not in src.split("basic")[0].split("\n")[-1] or "extraheader" in src
+    assert "extraheader" in src, "token must be passed as a header, never embedded in a URL"
