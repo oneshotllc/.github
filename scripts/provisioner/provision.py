@@ -189,18 +189,31 @@ def _has_content(sh: Shell, repo: str) -> bool:
 
 
 def _seed_from_template(sh: Shell, *, repo: str, template_repo: str) -> None:
-    """Mirror the template's default branch into the new repo over https,
-    authenticated the only way this host is allowed to push."""
+    """Mirror the template's default branch into the new repo over https.
+
+    Every git step is checked: a silent failure here used to surface much
+    later as the useless "repo is still empty" error (live run 34793408420),
+    hiding the actual cause.
+    """
     work = _tempfile.mkdtemp(prefix="seed-")
     src = _os.path.join(work, "src")
-    sh.git("clone", "--depth", "1", f"https://github.com/{template_repo}.git", src)
+
+    def _must(result, what: str):
+        if result.returncode != 0:
+            raise TemplateCopyTimeout(
+                f"{repo}: seeding failed at {what}: "
+                f"{(result.stderr or result.stdout or '').strip()[:400]}"
+            )
+        return result
+
+    _must(sh.git("clone", "--depth", "1", f"https://github.com/{template_repo}.git", src), "clone template")
     sh.run(["rm", "-rf", _os.path.join(src, ".git")])
-    sh.git("init", "-q", "-b", "main", cwd=src)
+    _must(sh.git("init", "-q", "-b", "main", cwd=src), "git init")
     sh.git("config", "user.email", "oneshot-pr-bot@users.noreply.github.com", cwd=src)
     sh.git("config", "user.name", "oneshot-pr-bot", cwd=src)
-    sh.git("add", "-A", cwd=src)
-    sh.git("commit", "-q", "-m", f"Provision: seed from {template_repo}", cwd=src)
-    sh.git("push", "-q", "-f", f"https://github.com/{repo}.git", "HEAD:main", cwd=src)
+    _must(sh.git("add", "-A", cwd=src), "git add")
+    _must(sh.git("commit", "-q", "-m", f"Provision: seed from {template_repo}", cwd=src), "git commit")
+    _must(sh.git("push", "-q", "-f", f"https://github.com/{repo}.git", "HEAD:main", cwd=src), "git push")
 
 
 def step_ensure_fly_app(sh: Shell, *, fly_app: str, region: str, fly_org: str = "oneshot-llc") -> ProvisioningTicket | None:
