@@ -22,6 +22,11 @@ on:
         description: The organization/site name to provision, e.g. "Voices of Power".
         required: true
         type: string
+      image_ref:
+        description: Prebuilt image the deploy step ships, e.g. registry.fly.io/oneshot-site-images:latest.
+        required: false
+        type: string
+        default: registry.fly.io/oneshot-site-images:latest
       domain:
         description: Optional custom domain. Defaults to <slug>.oneshot.help.
         required: false
@@ -47,6 +52,12 @@ on:
       fly-api-token:
         description: A Fly.io API token able to create apps/volumes in the oneshot-llc org.
         required: true
+      cloudflare-api-token:
+        description: Zone-scoped Cloudflare token (dns_records edit) for the site's DNS record.
+        required: false
+      cloudflare-zone-id:
+        description: Cloudflare zone id for the parent domain.
+        required: false
     outputs:
       repo:
         description: The full "owner/name" of the provisioned repository.
@@ -117,6 +128,12 @@ jobs:
           DOMAIN: ${{ inputs.domain }}
           REGION: ${{ inputs.region }}
           DRY_RUN: ${{ inputs.dry_run }}
+          # Deploy a PREBUILT image: image build time must never sit in the
+          # provisioning path (publish-image.yml builds it once).
+          IMAGE_REF: ${{ inputs.image_ref }}
+          # Zone-scoped token: enough for the DNS record + cert, nothing more.
+          CLOUDFLARE_API_TOKEN: ${{ secrets.cloudflare-api-token }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.cloudflare-zone-id }}
         run: |
           set -euo pipefail
           export PATH="$HOME/.fly/bin:$PATH"
