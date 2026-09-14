@@ -32,6 +32,7 @@ from provision import (  # noqa: E402
     step_create_repo,
     step_ensure_cert,
     step_ensure_dns_record,
+    derive_fly_app,
     step_ensure_fly_app,
     step_deploy_image,
     step_set_fly_secrets,
@@ -96,7 +97,7 @@ def main() -> int:
 
     slug = derive_slug_from_domain(domain)
     repo = f"oneshotmn/{slug}"
-    fly_app = slug
+    fly_app = derive_fly_app(domain)
 
     tickets: list[ProvisioningTicket] = []
     sh = CIShell()

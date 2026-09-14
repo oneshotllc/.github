@@ -212,18 +212,6 @@ def test_ensure_fly_app_converges_when_already_exists():
     create_calls = [c for c in sh.calls if "create" in c and "apps" in c]
     assert not create_calls, "must not attempt to create an app that already exists"
 
-def test_ensure_fly_app_treats_already_taken_as_converged_not_a_ticket():
-    sh = FakeShell(responses={
-        ("apps", "list"): cp(returncode=0, stdout="[]"),
-        ("apps", "create"): cp(returncode=1, stderr="Name has already been taken"),
-    })
-    ticket = step_ensure_fly_app(sh, fly_app="acme", region="ord")
-    assert ticket is None
-
-
-# --- step_ensure_volume ---------------------------------------------------
-
-
 def test_ensure_fly_app_creates_exactly_one_volume_when_absent():
     sh = FakeShell(responses={
         ("apps", "list"): cp(returncode=0, stdout="[]"),
@@ -363,7 +351,7 @@ def test_provision_site_is_idempotent_when_repo_already_exists(tmp_path: Path, m
     sh = FakeShell(responses={
         ("repo", "view"): cp(returncode=0),  # already exists
         ("api",): cp(returncode=0, stdout='[{"name":"main"}]'),  # copy already landed
-        ("apps", "list"): cp(returncode=0, stdout='[{"Name": "acme-corp"}]'),
+        ("apps", "list"): cp(returncode=0, stdout='[{"Name": "acme-corp-oneshot-help"}]'),
         ("workflow", "run"): cp(returncode=0),
     })
 
@@ -451,3 +439,30 @@ def test_infra_steps_raise_instead_of_ticketing():
         assert "return ProvisioningTicket(" not in src, (
             f"{name} must raise ProvisioningError, not file a ticket"
         )
+
+
+def test_fly_app_name_derives_from_whole_domain():
+    """Regression, live run 34800109357: fly_app was the bare slug, so
+    oneshot.help asked for the Fly app `oneshot` - a name already held by a
+    stranger (Fly names are globally unique). Creation failed with "taken",
+    the step treated that as success, and the run then died on `secrets
+    import` with a bare "unauthorized" against an app we do not own."""
+    from provisioner.provision import derive_fly_app
+    assert derive_fly_app("oneshot.help") == "oneshot-help"
+    assert derive_fly_app("voices-of-power.org") == "voices-of-power-org"
+
+
+def test_taken_app_name_is_not_treated_as_success():
+    """A globally-taken name must fail the run loudly, not silently proceed
+    against someone else's app."""
+    from provisioner.provision import ProvisioningError, step_ensure_fly_app
+
+    class TakenShell(FakeShell):
+        def run(self, argv, check=False):
+            self.calls.append(argv)
+            if "list" in argv:
+                return cp(returncode=0, stdout="[]")
+            return cp(returncode=1, stderr="App names are unique across all of Fly.io ... this name may be held")
+
+    with pytest.raises(ProvisioningError, match="taken"):
+        step_ensure_fly_app(TakenShell({}), fly_app="oneshot", region="ord")

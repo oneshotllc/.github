@@ -56,6 +56,16 @@ def derive_slug(org_name: str) -> str:
     return slug
 
 
+def derive_fly_app(domain: str) -> str:
+    """"oneshot.help" -> "oneshot-help". The whole domain, hyphenated, so the
+    name is as globally unique as the domain itself. A bare slug is not:
+    Fly app names are unique across all of Fly.io, not just one org."""
+    name = re.sub(r"[^a-z0-9]+", "-", domain.strip().lower()).strip("-")
+    if not name:
+        raise ValueError(f"domain {domain!r} has no alphanumeric content")
+    return name
+
+
 def derive_slug_from_domain(domain: str) -> str:
     """"oneshot.help" -> "oneshot"; "voices-of-power.org" -> "voices-of-power".
     The Fly app name and repo slug both come from the domain's first label
@@ -280,10 +290,30 @@ def step_ensure_fly_app(sh: Shell, *, fly_app: str, region: str, fly_org: str = 
     if fly_app not in names:
         created = sh.run(["flyctl", "apps", "create", fly_app, "--org", fly_org])
         stderr = (created.stderr or "").lower()
-        if created.returncode != 0 and "already" not in stderr and "taken" not in stderr:
-            raise ProvisioningError(
-                f"Cannot create Fly app {fly_app}: " + (_step_err(locals()))
-            )
+        if created.returncode != 0:
+            # "taken" must NOT count as success: Fly app names are unique
+            # across ALL of Fly, so a name held by a stranger looks exactly
+            # like our own existing app. Live run 34800109357 sailed past a
+            # taken `oneshot`, then failed on `secrets import` with a bare
+            # "unauthorized" - Fly's answer for an app you do not own.
+            owned = sh.run(["flyctl", "apps", "list", "--json"])
+            names = set()
+            if owned.returncode == 0:
+                try:
+                    names = {a.get("Name") for a in json.loads(owned.stdout or "[]")}
+                except ValueError:
+                    names = set()
+            if fly_app in names:
+                pass  # genuinely ours, created by an earlier run
+            elif "taken" in stderr or "unique" in stderr:
+                raise ProvisioningError(
+                    f"Fly app name {fly_app!r} is taken by an app outside this "
+                    f"organization. Derive a more specific name from the domain."
+                )
+            elif "already" not in stderr:
+                raise ProvisioningError(
+                    f"Cannot create Fly app {fly_app}: " + (_step_err(locals()))
+                )
     step_ensure_volume(sh, fly_app=fly_app, region=region, volume_name="wp_uploads")
     return None
 
@@ -583,8 +613,11 @@ def provision_site(
     org_name = inputs.org_name or derive_org_name_from_domain(inputs.domain)
     slug = derive_slug_from_domain(inputs.domain)
     repo = f"{org}/{slug}"
-    fly_app = slug
+    # Fly app names are globally unique, so a bare slug like "oneshot"
+    # collides with strangers' apps (live run 34800109357). The full domain
+    # is already unique and already ours, so derive from it.
     domain = inputs.domain
+    fly_app = derive_fly_app(domain)
     theme_tokens = "default"
 
     result = ProvisionResult(
