@@ -391,3 +391,15 @@ def test_cishell_exposes_git_for_seeding():
     src = inspect.getsource(CIShell.git)
     assert "x-access-token:" not in src.split("basic")[0].split("\n")[-1] or "extraheader" in src
     assert "extraheader" in src, "token must be passed as a header, never embedded in a URL"
+
+
+def test_app_token_is_minted_with_org_scope():
+    """Regression, live run 34793604383: create-github-app-token without an
+    `owner` mints a token scoped to the CALLING repo only, so the push that
+    seeds a freshly created repo fails with 'Repository not found'. The
+    provisioner creates repos, so its token must be org-scoped."""
+    from pathlib import Path
+    wf = Path(__file__).resolve().parents[3] / ".github" / "workflows" / "provision-site.yml"
+    text = wf.read_text()
+    mint = text.split("create-github-app-token")[1].split("- name:")[0]
+    assert "owner:" in mint, "app token must be minted with owner: for org-wide scope"

@@ -97,6 +97,11 @@ jobs:
         with:
           app-id: ${{ secrets.pr-app-id }}
           private-key: ${{ secrets.pr-app-private-key }}
+          # Without `owner`, the minted token is scoped to THIS repository
+          # only, so pushing to a repo the provisioner just created fails
+          # with "Repository not found" (live run 34793604383). Org scope
+          # covers every repo the app is installed on, including new ones.
+          owner: ${{ github.repository_owner }}
 
       - name: Install flyctl
         run: curl -L https://fly.io/install.sh | sh
