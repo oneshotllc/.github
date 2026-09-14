@@ -56,6 +56,18 @@ def derive_slug(org_name: str) -> str:
     return slug
 
 
+def derive_slug_from_domain(domain: str) -> str:
+    """"oneshot.help" -> "oneshot"; "voices-of-power.org" -> "voices-of-power".
+    The Fly app name and repo slug both come from the domain's first label
+    (not the whole domain — Fly app names can't contain dots), so
+    "oneshot.help" and a future "oneshot.com" would collide; that is an
+    intentional 1:1 domain-to-slug mapping for this org's flat domain set.
+    """
+    first_label = domain.strip().lower().split(".")[0]
+    return derive_slug(first_label)
+
+
+
 def generate_passphrase(rng: _secrets.SystemRandom | None = None) -> str:
     """correct-horse-battery-staple: four dictionary words + a two-digit
     suffix, hyphen-joined. Never a random hex token (BRIEF step 2.4).
@@ -88,9 +100,30 @@ class ProvisioningTicket:
 
 @dataclass
 class ProvisionInputs:
-    org_name: str
-    domain: str | None = None
+    """domain is the one required input (BRIEF step 4: "he gives a domain,
+    and one run spins the whole thing up"). org_name is an optional display
+    name — when omitted it is derived from the domain's first label
+    title-cased (oneshot.help -> "Oneshot"), matching how a human would name
+    an org after its own domain.
+    """
+
+    domain: str
+    org_name: str | None = None
     region: str = "ord"
+
+    def __post_init__(self) -> None:
+        if not self.domain or not self.domain.strip():
+            raise ValueError("domain is required and cannot be empty")
+
+
+def derive_org_name_from_domain(domain: str) -> str:
+    """"oneshot.help" -> "Oneshot"; "voices-of-power.org" -> "Voices Of Power".
+    Used only when the caller does not supply an explicit org_name.
+    """
+    first_label = domain.strip().split(".")[0]
+    words = re.split(r"[^a-zA-Z0-9]+", first_label)
+    return " ".join(w.capitalize() for w in words if w)
+
 
 
 @dataclass
@@ -230,11 +263,224 @@ def step_ensure_fly_app(sh: Shell, *, fly_app: str, region: str, fly_org: str = 
                 hit=(created.stderr or "non-zero exit, no stderr").strip(),
                 need="An account-scoped Fly token or org access for this app name.",
             )
-    sh.run([
-        "flyctl", "volumes", "create", "wp_uploads", "--app", fly_app,
-        "--region", region, "--size", "1", "--yes",
-    ])
+    step_ensure_volume(sh, fly_app=fly_app, region=region, volume_name="wp_uploads")
     return None
+
+
+def step_ensure_volume(
+    sh: Shell, *, fly_app: str, region: str, volume_name: str = "wp_uploads", size_gb: int = 1,
+) -> None:
+    """Idempotent volume creation. `flyctl volumes create` has no built-in
+    dedup — calling it twice makes two same-named volumes, both attachable,
+    with no guarantee a Machine gets the one holding prior data. Live
+    evidence: three `wp_uploads` volumes accumulated on one app from
+    provisioning being run three times by hand before this check existed.
+    List first, match on Name, create only when truly absent — running this
+    N times must always converge on exactly one volume.
+    """
+    listed = sh.run(["flyctl", "volumes", "list", "--app", fly_app, "--json"])
+    volumes = json.loads(listed.stdout or "[]") if listed.returncode == 0 else []
+    existing_names = {v.get("Name") for v in volumes}
+    if volume_name in existing_names:
+        return  # converge: already have one, never create a second
+    sh.run([
+        "flyctl", "volumes", "create", volume_name, "--app", fly_app,
+        "--region", region, "--size", str(size_gb), "--yes",
+    ])
+
+
+def step_set_fly_secrets(
+    sh: Shell, *, fly_app: str, secrets: dict[str, str],
+) -> ProvisioningTicket | None:
+    """`flyctl secrets set` is idempotent on its own (always overwrites,
+    never duplicates a key) — this wraps it only to give a consistent
+    ticket shape on failure. Values are piped via stdin through
+    `--stage`-free `import`-style NAME=VALUE args is avoided on purpose:
+    building a NAME=VALUE argv list would put secret values in process
+    argv, visible to anything that can list processes on the runner.
+    `flyctl secrets import` reads NAME=VALUE pairs from stdin instead.
+    """
+    payload = "\n".join(f"{k}={v}" for k, v in secrets.items())
+    proc = subprocess.run(
+        ["flyctl", "secrets", "import", "--app", fly_app, "--stage"],
+        input=payload, capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return ProvisioningTicket(
+            title=f"Cannot set Fly secrets on {fly_app}",
+            tried=f"flyctl secrets import --app {fly_app} --stage",
+            hit=(proc.stderr or "non-zero exit").strip(),
+            need="A Fly API token with write access to this app's secrets.",
+        )
+    return None
+
+
+def step_deploy_image(
+    sh: Shell, *, fly_app: str, image_ref: str, region: str,
+) -> ProvisioningTicket | None:
+    """Deploys a PREBUILT image — never `flyctl deploy` from source, which
+    would build during provisioning and put minutes of image-build time in
+    what should be a sub-minute path (BRIEF: image build time must not sit
+    in the provisioning path). The image is built and pushed once by
+    publish-image.yml; this step only ever references that existing tag.
+    """
+    deployed = sh.run([
+        "flyctl", "deploy", "--app", fly_app, "--image", image_ref,
+        "--remote-only", "--strategy", "immediate", "--region", region,
+    ])
+    if deployed.returncode != 0:
+        return ProvisioningTicket(
+            title=f"Cannot deploy {image_ref} to {fly_app}",
+            tried=f"flyctl deploy --app {fly_app} --image {image_ref} --remote-only",
+            hit=(deployed.stderr or deployed.stdout or "non-zero exit").strip()[:500],
+            need="A Fly API token with deploy access to this app.",
+        )
+    return None
+
+
+def step_ensure_dns_record(
+    http: "HttpClient", *, domain: str, target: str, zone_lookup: dict[str, str],
+) -> ProvisioningTicket | None:
+    """Points `domain` at `target` (a Fly app's flycast/anycast hostname,
+    e.g. "<fly_app>.fly.dev" via CNAME, or a Fly IP via A/AAAA) through the
+    Cloudflare API. Idempotent: looks up any existing record for this exact
+    name first and PATCHes it in place rather than POSTing a duplicate —
+    running provisioning twice must leave exactly one DNS record for the
+    domain, not two competing ones.
+
+    `zone_lookup` maps a registrable domain (e.g. "oneshot.help") to its
+    Cloudflare zone ID — the provisioner does not have account-level
+    Cloudflare access to list zones itself (BRIEF: the Cloudflare token is
+    zone-scoped), so the caller supplies the one zone ID it already knows.
+    """
+    zone_id = zone_lookup.get(domain) or zone_lookup.get(_registrable_domain(domain))
+    if not zone_id:
+        return ProvisioningTicket(
+            title=f"No Cloudflare zone ID known for {domain}",
+            tried="scripts/provisioner look up zone_lookup[domain]",
+            hit=f"{domain} is not a key in the configured zone lookup",
+            need="Add this domain's Cloudflare zone ID to the provisioner's zone lookup.",
+        )
+    existing = http.get(f"/zones/{zone_id}/dns_records", params={"name": domain, "type": "CNAME"})
+    if not existing.get("success"):
+        return ProvisioningTicket(
+            title=f"Cannot read DNS records for {domain}",
+            tried=f"GET /zones/{zone_id}/dns_records?name={domain}",
+            hit=json.dumps(existing.get("errors", []))[:300],
+            need="A Cloudflare API token with dns_records:read on this zone.",
+        )
+    records = existing.get("result") or []
+    body = {"type": "CNAME", "name": domain, "content": target, "proxied": False, "ttl": 60}
+    if records:
+        record_id = records[0]["id"]
+        if records[0].get("content") == target:
+            return None  # converge: already points at the right target
+        result = http.patch(f"/zones/{zone_id}/dns_records/{record_id}", json=body)
+    else:
+        result = http.post(f"/zones/{zone_id}/dns_records", json=body)
+    if not result.get("success"):
+        return ProvisioningTicket(
+            title=f"Cannot write DNS record for {domain}",
+            tried=f"{'PATCH' if records else 'POST'} /zones/{zone_id}/dns_records",
+            hit=json.dumps(result.get("errors", []))[:300],
+            need="A Cloudflare API token with dns_records:edit on this zone.",
+        )
+    return None
+
+
+def _registrable_domain(domain: str) -> str:
+    """"sub.oneshot.help" -> "oneshot.help". Naive last-two-labels split —
+    correct for every domain this org actually uses (no multi-part public
+    suffixes like .co.uk in play).
+    """
+    parts = domain.strip().lower().split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else domain
+
+
+def step_ensure_cert(sh: Shell, *, fly_app: str, domain: str) -> ProvisioningTicket | None:
+    """`flyctl certs add` is idempotent server-side: adding the same
+    hostname twice is a no-op, not a duplicate — Fly's certs API keys on
+    hostname, not on an add-call count.
+    """
+    added = sh.run(["flyctl", "certs", "add", domain, "--app", fly_app])
+    stderr = (added.stderr or "").lower()
+    if added.returncode != 0 and "already" not in stderr and "exist" not in stderr:
+        return ProvisioningTicket(
+            title=f"Cannot add cert for {domain} on {fly_app}",
+            tried=f"flyctl certs add {domain} --app {fly_app}",
+            hit=(added.stderr or "non-zero exit").strip(),
+            need="A Fly API token with cert-management access to this app.",
+        )
+    return None
+
+
+def poll_until_200(
+    fetch: Callable[[str], int], url: str, *, timeout_seconds: float = 300,
+    poll_schedule: tuple[float, ...] = (0.2, 0.2, 0.5, 0.5, 1, 1, 2, 2, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5),
+) -> tuple[bool, float]:
+    """Sub-second-first exponential-ish backoff, never a fixed sleep: most
+    of the schedule's early steps are 200-500ms so a fast deploy (the
+    common case with a prebuilt image) reports success in well under a
+    second of polling overhead, while the tail still covers Fly's slower
+    cold-start cases up to the timeout. Returns (reached_200, elapsed_seconds).
+    """
+    start = _time.monotonic()
+    i = 0
+    while True:
+        elapsed = _time.monotonic() - start
+        if elapsed >= timeout_seconds:
+            return False, elapsed
+        try:
+            if fetch(url) == 200:
+                return True, _time.monotonic() - start
+        except Exception:
+            pass
+        wait = poll_schedule[min(i, len(poll_schedule) - 1)]
+        remaining = timeout_seconds - (_time.monotonic() - start)
+        _time.sleep(max(0.0, min(wait, remaining)))
+        i += 1
+
+
+class HttpClient:
+    """Thin wrapper around Cloudflare's REST API, using only the stdlib so
+    the provisioner has no extra runtime dependency. Tests fake this
+    wholesale (see FakeHttpClient) the same way Shell is faked for gh/flyctl.
+    """
+
+    def __init__(self, base_url: str, token: str):
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+
+    def _request(self, method: str, path: str, *, params: dict | None = None, json_body: dict | None = None) -> dict:
+        import urllib.parse
+        import urllib.request
+        import urllib.error
+
+        url = self.base_url + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        data = json.dumps(json_body).encode() if json_body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            try:
+                return json.loads(e.read().decode())
+            except Exception:
+                return {"success": False, "errors": [{"message": str(e)}]}
+
+    def get(self, path: str, *, params: dict | None = None) -> dict:
+        return self._request("GET", path, params=params)
+
+    def post(self, path: str, *, json: dict) -> dict:
+        return self._request("POST", path, json_body=json)
+
+    def patch(self, path: str, *, json: dict) -> dict:
+        return self._request("PATCH", path, json_body=json)
+
 
 
 def step_set_repo_secrets(sh: Shell, *, repo: str, secret_names_and_paths: dict[str, str]) -> ProvisioningTicket | None:
@@ -309,15 +555,27 @@ def provision_site(
     template_repo: str = "oneshotmn/site-template",
     organizations_path: Path,
     secret_sources: dict[str, str] | None = None,
+    image_ref: str | None = None,
+    http: "HttpClient | None" = None,
+    zone_lookup: dict[str, str] | None = None,
+    fetch: Callable[[str], int] | None = None,
+    skip_deploy: bool = False,
 ) -> ProvisionResult:
-    slug = derive_slug(inputs.org_name)
+    """domain-first: `inputs.domain` alone is sufficient (BRIEF step 4).
+    org_name is resolved from the domain when not given explicitly, so
+    `ProvisionInputs(domain="oneshot.help")` and
+    `ProvisionInputs(domain="oneshot.help", org_name="OneShot")` provision
+    the identical repo/app/slug — only the display name in repo.yml differs.
+    """
+    org_name = inputs.org_name or derive_org_name_from_domain(inputs.domain)
+    slug = derive_slug_from_domain(inputs.domain)
     repo = f"{org}/{slug}"
     fly_app = slug
-    domain = inputs.domain or f"{slug}.oneshot.help"
+    domain = inputs.domain
     theme_tokens = "default"
 
     result = ProvisionResult(
-        org_name=inputs.org_name, slug=slug, repo=repo, fly_app=fly_app,
+        org_name=org_name, slug=slug, repo=repo, fly_app=fly_app,
         domain=domain, theme_tokens=theme_tokens,
     )
 
@@ -368,17 +626,66 @@ def provision_site(
         result.steps_completed.append("set_repo_secrets")
 
     step_register_organization(
-        organizations_path=organizations_path, org_id=slug, org_name=inputs.org_name, repo=repo
+        organizations_path=organizations_path, org_id=slug, org_name=org_name, repo=repo
     )
     result.steps_completed.append("register_organization")
 
-    preview_status, preview_ticket = step_trigger_preview(sh, repo=repo)
-    if preview_ticket:
-        result.tickets.append(preview_ticket)
-        file_ticket(sh, preview_ticket)
+    if skip_deploy:
+        return result
+
+    fly_secrets_ticket = step_set_fly_secrets(
+        sh, fly_app=fly_app,
+        secrets={
+            "WP_ADMIN_PASSPHRASE": passphrase,
+            "WP_HOME": f"https://{domain}",
+            "WP_SITE_TITLE": org_name,
+        },
+    )
+    if fly_secrets_ticket:
+        result.tickets.append(fly_secrets_ticket)
+        file_ticket(sh, fly_secrets_ticket)
     else:
-        result.steps_completed.append("trigger_preview")
-        result.preview_url = preview_status
+        result.steps_completed.append("set_fly_secrets")
+
+    if image_ref:
+        deploy_ticket = step_deploy_image(sh, fly_app=fly_app, image_ref=image_ref, region=inputs.region)
+        if deploy_ticket:
+            result.tickets.append(deploy_ticket)
+            file_ticket(sh, deploy_ticket)
+        else:
+            result.steps_completed.append("deploy_image")
+
+    if http and zone_lookup is not None:
+        dns_ticket = step_ensure_dns_record(
+            http, domain=domain, target=f"{fly_app}.fly.dev", zone_lookup=zone_lookup
+        )
+        if dns_ticket:
+            result.tickets.append(dns_ticket)
+            file_ticket(sh, dns_ticket)
+        else:
+            result.steps_completed.append("ensure_dns_record")
+
+        cert_ticket = step_ensure_cert(sh, fly_app=fly_app, domain=domain)
+        if cert_ticket:
+            result.tickets.append(cert_ticket)
+            file_ticket(sh, cert_ticket)
+        else:
+            result.steps_completed.append("ensure_cert")
+
+    if fetch and image_ref:
+        reached, elapsed = poll_until_200(fetch, f"https://{fly_app}.fly.dev/")
+        result.steps_completed.append(f"poll_until_200({'ok' if reached else 'timed_out'},{elapsed:.1f}s)")
+        if reached:
+            result.preview_url = f"https://{fly_app}.fly.dev/"
+        else:
+            result.tickets.append(
+                ProvisioningTicket(
+                    title=f"{fly_app} never reached 200 within the poll window",
+                    tried=f"poll https://{fly_app}.fly.dev/ with sub-second backoff up to 300s",
+                    hit=f"still not 200 after {elapsed:.1f}s",
+                    need="Investigate the Machine's boot log — this is a hard failure, not a missing credential.",
+                )
+            )
 
     return result
 
@@ -386,11 +693,11 @@ def provision_site(
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     if not argv:
-        print("usage: provision.py <org_name> [domain]", file=sys.stderr)
+        print("usage: provision.py <domain> [org_name]", file=sys.stderr)
         return 2
-    org_name = argv[0]
-    domain = argv[1] if len(argv) > 1 else None
-    inputs = ProvisionInputs(org_name=org_name, domain=domain)
+    domain = argv[0]
+    org_name = argv[1] if len(argv) > 1 else None
+    inputs = ProvisionInputs(domain=domain, org_name=org_name)
     sh = Shell()
     organizations_path = Path(
         "/Users/oneshot-agent/code/oneshot-pipeline/config/organizations.yaml"

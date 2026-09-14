@@ -22,14 +22,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from provision import (  # noqa: E402
+    HttpClient,
     ProvisioningTicket,
-    derive_slug,
+    derive_org_name_from_domain,
+    derive_slug_from_domain,
     file_ticket,
     generate_passphrase,
+    poll_until_200,
     step_create_repo,
+    step_ensure_cert,
+    step_ensure_dns_record,
     step_ensure_fly_app,
+    step_deploy_image,
+    step_set_fly_secrets,
     step_set_repo_secrets,
-    step_trigger_preview,
 )
 
 
@@ -80,15 +86,17 @@ def write_secret_from_env(repo: str, secret_name: str, env_var: str) -> Provisio
 
 
 def main() -> int:
-    org_name = os.environ["ORG_NAME"]
-    domain_in = os.environ.get("DOMAIN", "").strip()
+    domain = os.environ["DOMAIN"].strip()
+    org_name = os.environ.get("ORG_NAME", "").strip() or derive_org_name_from_domain(domain)
     region = os.environ.get("REGION", "ord").strip() or "ord"
+    image_ref = os.environ.get("IMAGE_REF", "").strip()
+    cloudflare_token = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+    cloudflare_zone_id = os.environ.get("CLOUDFLARE_ZONE_ID", "").strip()
     dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
 
-    slug = derive_slug(org_name)
+    slug = derive_slug_from_domain(domain)
     repo = f"oneshotmn/{slug}"
     fly_app = slug
-    domain = domain_in or f"{slug}.oneshot.help"
 
     tickets: list[ProvisioningTicket] = []
     sh = CIShell()
@@ -96,7 +104,7 @@ def main() -> int:
     plan = {"org_name": org_name, "slug": slug, "repo": repo, "fly_app": fly_app, "domain": domain}
     if dry_run:
         print(json.dumps(plan, indent=2))
-        _emit_outputs(repo=repo, slug=slug, fly_app=fly_app, tickets_filed=0)
+        _emit_outputs(repo=repo, slug=slug, fly_app=fly_app, tickets_filed=0, live_url=None)
         return 0
 
     step_create_repo(sh, repo=repo, template_repo="oneshotmn/site-template")
@@ -164,17 +172,89 @@ def main() -> int:
             tickets.append(t)
             file_ticket(sh, t)
 
-    status, preview_ticket = step_trigger_preview(sh, repo=repo)
-    if preview_ticket:
-        tickets.append(preview_ticket)
-        file_ticket(sh, preview_ticket)
+    fly_secrets_ticket = step_set_fly_secrets(
+        sh, fly_app=fly_app,
+        secrets={
+            "WP_ADMIN_PASSPHRASE": passphrase,
+            "WP_HOME": f"https://{domain}",
+            "WP_SITE_TITLE": org_name,
+        },
+    )
+    if fly_secrets_ticket:
+        tickets.append(fly_secrets_ticket)
+        file_ticket(sh, fly_secrets_ticket)
 
-    print(json.dumps({**plan, "tickets": [t.title for t in tickets]}, indent=2))
-    _emit_outputs(repo=repo, slug=slug, fly_app=fly_app, tickets_filed=len(tickets))
+    live_url: str | None = None
+    if image_ref:
+        deploy_ticket = step_deploy_image(sh, fly_app=fly_app, image_ref=image_ref, region=region)
+        if deploy_ticket:
+            tickets.append(deploy_ticket)
+            file_ticket(sh, deploy_ticket)
+    else:
+        tickets.append(ProvisioningTicket(
+            title=f"No IMAGE_REF provided to deploy {fly_app}",
+            tried="step_deploy_image with $IMAGE_REF",
+            hit="IMAGE_REF was empty in the provision-site.yml job environment",
+            need="Wire IMAGE_REF (the published site image tag) into provision-site.yml's env.",
+        ))
+
+    if cloudflare_token and cloudflare_zone_id:
+        http = HttpClient("https://api.cloudflare.com/client/v4", cloudflare_token)
+        zone_lookup = {_registrable_domain_local(domain): cloudflare_zone_id, domain: cloudflare_zone_id}
+        dns_ticket = step_ensure_dns_record(http, domain=domain, target=f"{fly_app}.fly.dev", zone_lookup=zone_lookup)
+        if dns_ticket:
+            tickets.append(dns_ticket)
+            file_ticket(sh, dns_ticket)
+
+        cert_ticket = step_ensure_cert(sh, fly_app=fly_app, domain=domain)
+        if cert_ticket:
+            tickets.append(cert_ticket)
+            file_ticket(sh, cert_ticket)
+    else:
+        tickets.append(ProvisioningTicket(
+            title=f"No Cloudflare credentials to point {domain} at {fly_app}",
+            tried="step_ensure_dns_record with $CLOUDFLARE_API_TOKEN / $CLOUDFLARE_ZONE_ID",
+            hit="one or both env vars were empty in the provision-site.yml job environment",
+            need="Wire CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID into provision-site.yml's secrets/env.",
+        ))
+
+    if image_ref:
+        reached, elapsed = poll_until_200(_http_status, f"https://{fly_app}.fly.dev/")
+        print(f"poll_until_200: reached={reached} elapsed={elapsed:.2f}s")
+        if reached:
+            live_url = f"https://{fly_app}.fly.dev/"
+        else:
+            tickets.append(ProvisioningTicket(
+                title=f"{fly_app} never reached 200 within the poll window",
+                tried=f"poll https://{fly_app}.fly.dev/ with sub-second backoff up to 300s",
+                hit=f"still not 200 after {elapsed:.1f}s",
+                need="Investigate the Machine's boot log — this is a hard failure, not a missing credential.",
+            ))
+
+    print(json.dumps({**plan, "tickets": [t.title for t in tickets], "live_url": live_url}, indent=2))
+    _emit_outputs(repo=repo, slug=slug, fly_app=fly_app, tickets_filed=len(tickets), live_url=live_url)
     return 0
 
 
-def _emit_outputs(*, repo: str, slug: str, fly_app: str, tickets_filed: int) -> None:
+def _registrable_domain_local(domain: str) -> str:
+    parts = domain.strip().lower().split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else domain
+
+
+def _http_status(url: str) -> int:
+    import urllib.request
+    import urllib.error
+
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return 0
+
+
+def _emit_outputs(*, repo: str, slug: str, fly_app: str, tickets_filed: int, live_url: str | None) -> None:
     gh_out = os.environ.get("GITHUB_OUTPUT")
     if not gh_out:
         return
@@ -183,6 +263,7 @@ def _emit_outputs(*, repo: str, slug: str, fly_app: str, tickets_filed: int) -> 
         f.write(f"slug={slug}\n")
         f.write(f"fly_app={fly_app}\n")
         f.write(f"tickets_filed={tickets_filed}\n")
+        f.write(f"live_url={live_url or ''}\n")
 
 
 if __name__ == "__main__":

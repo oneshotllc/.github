@@ -233,6 +233,61 @@ def test_ensure_fly_app_treats_already_taken_as_converged_not_a_ticket():
     assert ticket is None
 
 
+# --- step_ensure_volume ---------------------------------------------------
+
+
+def test_ensure_fly_app_creates_exactly_one_volume_when_absent():
+    sh = FakeShell(responses={
+        ("apps", "list"): cp(returncode=0, stdout="[]"),
+        ("volumes", "list"): cp(returncode=0, stdout="[]"),
+    })
+    step_ensure_fly_app(sh, fly_app="acme", region="ord")
+    volume_creates = [c for c in sh.calls if "volumes" in c and "create" in c]
+    assert len(volume_creates) == 1
+
+
+def test_ensure_fly_app_does_not_create_a_second_volume_when_one_exists():
+    """Live bug: template-proof accumulated THREE wp_uploads volumes because
+    nothing checked for an existing one before calling `flyctl volumes
+    create`. Running provisioning N times against an app that already has
+    the volume must create zero more.
+    """
+    sh = FakeShell(responses={
+        ("apps", "list"): cp(returncode=0, stdout='[{"Name": "acme"}]'),
+        ("volumes", "list"): cp(returncode=0, stdout='[{"Name": "wp_uploads", "id": "vol_existing"}]'),
+    })
+    step_ensure_fly_app(sh, fly_app="acme", region="ord")
+    volume_creates = [c for c in sh.calls if "volumes" in c and "create" in c]
+    assert volume_creates == [], "must not create a second wp_uploads volume when one already exists"
+
+
+def test_ensure_fly_app_run_three_times_yields_exactly_one_volume_create():
+    """Simulates calling step_ensure_fly_app three times in a row (as three
+    provisioning runs would): the first call sees no volume and creates one;
+    the fake then reports that volume as existing for every subsequent call,
+    matching real `flyctl volumes list` behavior. Exactly one create total.
+    """
+    state = {"has_volume": False}
+
+    class StatefulShell(FakeShell):
+        def run(self, argv, check: bool = False):
+            if "volumes" in argv and "list" in argv:
+                stdout = '[{"Name": "wp_uploads", "id": "vol_existing"}]' if state["has_volume"] else "[]"
+                self.calls.append(argv)
+                return cp(returncode=0, stdout=stdout)
+            if "volumes" in argv and "create" in argv:
+                state["has_volume"] = True
+            return super().run(argv, check=check)
+
+    sh = StatefulShell(responses={
+        ("apps", "list"): cp(returncode=0, stdout='[{"Name": "acme"}]'),
+    })
+    for _ in range(3):
+        step_ensure_fly_app(sh, fly_app="acme", region="ord")
+    volume_creates = [c for c in sh.calls if "volumes" in c and "create" in c]
+    assert len(volume_creates) == 1, f"expected exactly one volume create across 3 runs, got {len(volume_creates)}"
+
+
 # --- step_register_organization -----------------------------------------
 
 
@@ -310,7 +365,8 @@ def test_provision_site_full_run_reports_every_step(tmp_path: Path, monkeypatch)
     monkeypatch.setattr("subprocess.run", lambda *a, **k: FakeCompleted())
 
     result = provision_site(
-        ProvisionInputs(org_name="Acme Corp"), sh, organizations_path=orgs_path, secret_sources={}
+        ProvisionInputs(domain="acme-corp.oneshot.help", org_name="Acme Corp"), sh,
+        organizations_path=orgs_path, secret_sources={}, skip_deploy=True,
     )
 
     assert result.slug == "acme-corp"
@@ -319,7 +375,6 @@ def test_provision_site_full_run_reports_every_step(tmp_path: Path, monkeypatch)
     assert "create_repo" in result.steps_completed
     assert "ensure_fly_app" in result.steps_completed
     assert "register_organization" in result.steps_completed
-    assert "trigger_preview" in result.steps_completed
     assert result.tickets == []
 
 
@@ -340,7 +395,8 @@ def test_provision_site_is_idempotent_when_repo_already_exists(tmp_path: Path, m
     monkeypatch.setattr("subprocess.run", lambda *a, **k: FakeCompleted())
 
     result = provision_site(
-        ProvisionInputs(org_name="Acme Corp"), sh, organizations_path=orgs_path, secret_sources={}
+        ProvisionInputs(domain="acme-corp.oneshot.help", org_name="Acme Corp"), sh,
+        organizations_path=orgs_path, secret_sources={}, skip_deploy=True,
     )
 
     repo_create_calls = [c for c in sh.calls if "repo" in c and "create" in c]
@@ -369,13 +425,13 @@ def test_provision_site_files_ticket_and_continues_when_fly_blocked(tmp_path: Pa
     monkeypatch.setattr("subprocess.run", lambda *a, **k: FakeCompleted())
 
     result = provision_site(
-        ProvisionInputs(org_name="Acme Corp"), sh, organizations_path=orgs_path, secret_sources={}
+        ProvisionInputs(domain="acme-corp.oneshot.help", org_name="Acme Corp"), sh,
+        organizations_path=orgs_path, secret_sources={}, skip_deploy=True,
     )
 
     assert any("Fly app" in t.title for t in result.tickets)
     # Provisioning must continue past the blocked step:
     assert "register_organization" in result.steps_completed
-    assert "trigger_preview" in result.steps_completed
 
 
 

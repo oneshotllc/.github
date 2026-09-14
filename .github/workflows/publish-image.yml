@@ -1,0 +1,86 @@
+name: Publish site image
+
+# Builds this repo's Dockerfile ONCE and pushes it to a Fly-hosted registry
+# under a stable, always-current tag. This is what keeps image build time
+# OUT of the provisioning path: provision-site.yml's deploy step passes
+# `--image registry.fly.io/<image-app>:<image-tag>` to `flyctl deploy` and
+# never runs `docker build` — the image already exists by the time anyone
+# provisions a new site from this template.
+#
+# The image-hosting Fly app is created idempotently here (never by hand):
+# `flyctl apps create ... || true` converges whether or not it already
+# exists, same contract as scripts/provisioner/provision.py's
+# step_ensure_fly_app.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on-label:
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      image-app:
+        description: The Fly app whose registry namespace hosts the image (not a running site).
+        required: false
+        type: string
+        default: "oneshot-site-images"
+      image-tag:
+        description: Tag the freshly-built image gets, in addition to being pushed.
+        required: false
+        type: string
+        default: "live"
+      fly-org:
+        required: false
+        type: string
+        default: "oneshot-llc"
+    secrets:
+      fly-api-token:
+        required: true
+    outputs:
+      image-ref:
+        description: The full pushed image reference, e.g. registry.fly.io/oneshot-site-images:live.
+        value: ${{ jobs.publish.outputs.image-ref }}
+
+concurrency:
+  group: publish-image-${{ inputs.image-app }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ${{ fromJSON(inputs.runs-on-label) }}
+    permissions:
+      contents: read
+    outputs:
+      image-ref: ${{ steps.emit.outputs.image-ref }}
+    env:
+      FLY_API_TOKEN: ${{ secrets.fly-api-token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install flyctl
+        run: curl -L https://fly.io/install.sh | sh
+
+      - name: Ensure the image-hosting Fly app exists (idempotent)
+        run: |
+          export PATH="$HOME/.fly/bin:$PATH"
+          flyctl apps create "${{ inputs.image-app }}" --org "${{ inputs.fly-org }}" || true
+
+      - name: Build and push (no deploy — this app never runs a Machine)
+        run: |
+          export PATH="$HOME/.fly/bin:$PATH"
+          flyctl deploy --app "${{ inputs.image-app }}" --build-only --push --remote-only \
+            --image-label "${{ inputs.image-tag }}"
+
+      - name: Emit the image reference
+        id: emit
+        run: echo "image-ref=registry.fly.io/${{ inputs.image-app }}:${{ inputs.image-tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: Record what was published
+        env:
+          IMAGE_REF: registry.fly.io/${{ inputs.image-app }}:${{ inputs.image-tag }}
+        run: |
+          {
+            echo "## Published site image"
+            echo
+            echo "\`$IMAGE_REF\` — provisioning deploys this tag, never builds it."
+          } >> "$GITHUB_STEP_SUMMARY"
