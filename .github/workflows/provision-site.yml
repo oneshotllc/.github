@@ -14,6 +14,19 @@ name: Provision site
 # Runs on ubuntu-latest deliberately: the org's only self-hosted runner is
 # scoped to oneshotmn/oneshotmn (legacy, out of scope — never touched by
 # this workflow) and is not available to other repos.
+#
+# "Is it deployed?" has exactly one accepted answer: the render proof step
+# below (scripts/provisioner/render_proof.py). Headless Chromium on this
+# GitHub-hosted runner - clean network, outside our infrastructure, no
+# resolver overrides - loads the live URL as an anonymous phone and desktop
+# visitor; screenshots + report.json are uploaded as the run's
+# render-proof-<fly_app> artifact, and a FAIL fails the job. A 200 from curl
+# is not evidence (a site once answered 200 while its CSS/JS pointed at a
+# domain with no DNS), and neither is anything checked from the local Mac:
+# its resolver returns only AAAA for *.fly.dev with no IPv6 route, so it
+# fails live sites, and resolver hacks there prove nothing about real
+# visitors. render_verdict=PASS means the page rendered on the runner;
+# SKIPPED (no live_url: dry run, no image, never reached 200) proves nothing.
 
 on:
   workflow_call:
@@ -76,6 +89,12 @@ on:
       tickets_filed:
         description: Count of provisioning tickets filed for follow-up.
         value: ${{ jobs.provision.outputs.tickets_filed }}
+      live_url:
+        description: The .fly.dev URL that answered 200; empty on dry run, no image_ref, or never reached.
+        value: ${{ jobs.provision.outputs.live_url }}
+      render_verdict:
+        description: PASS/FAIL from the runner's render proof of live_url; SKIPPED when live_url is empty (SKIPPED is not evidence of a deployed site).
+        value: ${{ jobs.provision.outputs.render_verdict }}
 
 permissions:
   contents: read
@@ -87,12 +106,16 @@ concurrency:
 jobs:
   provision:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 20, not 15: the render proof adds a Chromium install (~1-2 min) and
+    # two renders after the up-to-300s liveness poll.
+    timeout-minutes: 20
     outputs:
       repo: ${{ steps.run.outputs.repo }}
       slug: ${{ steps.run.outputs.slug }}
       fly_app: ${{ steps.run.outputs.fly_app }}
       tickets_filed: ${{ steps.run.outputs.tickets_filed }}
+      live_url: ${{ steps.run.outputs.live_url }}
+      render_verdict: ${{ steps.run.outputs.live_url == '' && 'SKIPPED' || steps.render.outputs.verdict }}
     steps:
       - name: Check out this repo's provisioner scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -155,3 +178,28 @@ jobs:
             echo
             echo "Tickets filed for follow-up: ${TICKETS:-0}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Render proof: the only accepted evidence the site is deployed (see
+      # the header). Runs only when the provisioner reached a live URL.
+      - name: Install Playwright + Chromium for the render proof
+        if: steps.run.outputs.live_url != ''
+        run: |
+          set -euo pipefail
+          pip install --quiet playwright==1.62.0
+          python -m playwright install --with-deps chromium
+
+      - name: Render proof of the live URL (FAIL fails the job)
+        id: render
+        if: steps.run.outputs.live_url != ''
+        env:
+          LIVE_URL: ${{ steps.run.outputs.live_url }}
+        run: python scripts/provisioner/render_proof.py "$LIVE_URL" "$RUNNER_TEMP/render-proof"
+
+      - name: Upload render proof (screenshots + report.json)
+        if: always() && steps.run.outputs.live_url != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-proof-${{ steps.run.outputs.fly_app }}
+          path: ${{ runner.temp }}/render-proof
+          retention-days: 30
+          if-no-files-found: error

@@ -1,0 +1,77 @@
+name: Render check
+
+# "Is this URL up?" - answered from a GitHub-hosted runner, never from the
+# local Mac. Headless Chromium (scripts/provisioner/render_proof.py) loads
+# the URL as an anonymous phone and desktop visitor with no resolver or host
+# overrides, uploads mobile.png + desktop.png + report.json as the
+# render-proof-<run_id> artifact, writes the verdict to the step summary,
+# and fails the job on FAIL. A green run means the page rendered.
+#
+# Why not check locally: a curl 200 once "proved" a site whose CSS/JS
+# pointed at a domain with no DNS, and the Mac's resolver returns only AAAA
+# for *.fly.dev with no IPv6 route, so local renders fail live sites and
+# resolver workarounds prove nothing about real visitors. The answer to the
+# owner is this run's URL and its screenshot artifact.
+#
+# Dispatch:  gh workflow run render-check.yml --repo oneshotmn/.github -f url=<url>
+# provision-site.yml runs the same script inline after provisioning.
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Full http(s) URL to render, e.g. https://acme-site.fly.dev/
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      url:
+        description: Full http(s) URL to render.
+        required: true
+        type: string
+    outputs:
+      verdict:
+        description: PASS or FAIL from the render proof.
+        value: ${{ jobs.render.outputs.verdict }}
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      verdict: ${{ steps.proof.outputs.verdict }}
+    steps:
+      - name: Check out the render proof script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: oneshotmn/.github
+          sparse-checkout: |
+            scripts/provisioner
+
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright + Chromium
+        run: |
+          set -euo pipefail
+          pip install --quiet playwright==1.62.0
+          python -m playwright install --with-deps chromium
+
+      - name: Render proof (FAIL fails the job)
+        id: proof
+        env:
+          URL: ${{ inputs.url }}
+        run: python scripts/provisioner/render_proof.py "$URL" "$RUNNER_TEMP/render-proof"
+
+      - name: Upload render proof (screenshots + report.json)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-proof-${{ github.run_id }}
+          path: ${{ runner.temp }}/render-proof
+          retention-days: 30
+          if-no-files-found: error
