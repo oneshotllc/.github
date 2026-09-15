@@ -203,3 +203,12 @@ jobs:
           path: ${{ runner.temp }}/render-proof
           retention-days: 30
           if-no-files-found: error
+
+      # A deploy that never produced a live URL must not end green: without
+      # a render there is no evidence the site exists. Dry runs and runs
+      # without an image never deploy, so they stay exempt.
+      - name: Require a rendered page for a real deploy
+        if: inputs.dry_run != true && inputs.image_ref != '' && steps.run.outputs.live_url == ''
+        run: |
+          echo "::error::Deploy ran but the site never reached a live URL, so there is no render proof. Failing the run: a green provisioning run must mean a rendered page."
+          exit 1
