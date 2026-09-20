@@ -1,0 +1,137 @@
+name: build
+
+# Build stage of the pipeline. Dispatched by the automation's build-queue consumer with everything it needs
+# as inputs; this file carries no organization, repository, label, person or host of its own.
+#
+# Properties that keep this safe:
+#  - workflow_dispatch is the only door; the dispatcher checks for an existing PR on the deterministic
+#    branch before dispatching, and the concurrency group below serializes per issue.
+#  - The dispatch is a claim, not a fact: the first step re-reads the issue and refuses to build if the
+#    hold label has come back since the queue entry was made.
+#  - The App authors the branch and the PR, never the Actions token, so CI and the merge stage see them.
+#  - The job never merges and never reviews; approval belongs to the configured approvers.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:          { description: "owner/name of the repository to build in", type: string, required: true }
+      issue:         { description: "issue number", type: string, required: true }
+      branch:        { description: "deterministic branch name for this issue", type: string, required: true }
+      hold_label:    { description: "label that means 'not approved'", type: string, required: true }
+      pr_open_label: { description: "label applied to the issue when the PR opens", type: string, required: true }
+      reviewers:     { description: "comma-separated logins to request review from", type: string, required: true }
+      runner_label:  { description: "self-hosted runner label", type: string, required: true }
+      spec_sentinel: { description: "text that identifies the specification comment", type: string, required: true }
+
+concurrency:
+  group: build-${{ inputs.repo }}-${{ inputs.issue }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 60
+    steps:
+      - name: Mint the App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.ONESHOT_PR_APP_ID }}
+          private-key: ${{ secrets.ONESHOT_PR_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Re-read approval at the moment of use
+        id: gate
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ inputs.repo }}
+          ISSUE: ${{ inputs.issue }}
+          HOLD: ${{ inputs.hold_label }}
+        run: |
+          set -euo pipefail
+          json="$RUNNER_TEMP/issue.json"
+          gh issue view "$ISSUE" --repo "$REPO" --json labels,title,state > "$json"
+          if jq -e --arg h "$HOLD" '[.labels[].name] | any(. == $h)' "$json" > /dev/null; then
+            echo "::error::Issue #$ISSUE carries the hold label again; approval was withdrawn after dispatch. Nothing written."; exit 1; fi
+          if [ "$(jq -r .state "$json")" != "OPEN" ]; then echo "::error::Issue #$ISSUE is not open."; exit 1; fi
+          echo "title=$(jq -r .title "$json")" >> "$GITHUB_OUTPUT"
+
+      - name: Fresh checkout of the target repository
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ inputs.repo }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/src"; rm -rf "$dir"
+          git -c credential.helper= -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')" clone --quiet "https://github.com/$REPO.git" "$dir"
+          cd "$dir"
+          git config user.name "${{ github.actor }}"; git config user.email "${{ github.actor }}@users.noreply.github.com"
+          git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          default=$(git symbolic-ref --short refs/remotes/origin/HEAD | sed 's#origin/##')
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then git checkout -B "$BRANCH" "origin/$BRANCH"; else git checkout -B "$BRANCH" "origin/$default"; fi
+          echo "default=$default" >> "$GITHUB_ENV"; echo "src=$dir" >> "$GITHUB_ENV"
+
+      - name: Read the specification comment
+        id: spec
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ inputs.repo }}
+          ISSUE: ${{ inputs.issue }}
+          SENTINEL: ${{ inputs.spec_sentinel }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/issues/$ISSUE/comments" --paginate --jq --arg s "$SENTINEL" '[.[] | select(.body | contains($s))] | last | .body // empty' > "$RUNNER_TEMP/spec.md"
+          [ -s "$RUNNER_TEMP/spec.md" ] || { echo "::error::No specification comment found on #$ISSUE; the triage step has not run."; exit 1; }
+          gh issue view "$ISSUE" --repo "$REPO" --json body --jq .body > "$RUNNER_TEMP/issue.md"
+
+      - name: Build the ticket with the coding agent
+        working-directory: ${{ env.src }}
+        env:
+          REPO: ${{ inputs.repo }}
+          ISSUE: ${{ inputs.issue }}
+        run: |
+          set -euo pipefail
+          prompt=$(cat <<PROMPT
+          You are building GitHub issue #$ISSUE in repository $REPO. You are in a fresh checkout on the branch this ticket builds on. Work here and nowhere else.
+
+          The issue body is in $RUNNER_TEMP/issue.md and the approved specification comment is in $RUNNER_TEMP/spec.md. Follow the specification; where it is silent, make the smallest change that satisfies the ticket.
+
+          Write the failing test first, run it, then make it pass. Run the repository's own lint, typecheck, test and build commands if they exist and leave them green. Commit on the current branch with a message that says what changed and why. Do not push and do not open a pull request; the workflow does that after you stop.
+          PROMPT
+          )
+          claude -p "$prompt" --permission-mode acceptEdits --max-turns 60 \
+            --allowedTools "Read,Grep,Glob,Edit,Write,Bash(npm ci:*),Bash(npm install:*),Bash(npm run:*),Bash(npm test:*),Bash(npx:*),Bash(node:*),Bash(git add:*),Bash(git commit:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(ls:*),Bash(cat:*)" \
+            2>&1 | tail -c 20000
+
+      - name: Push the branch and open the pull request
+        working-directory: ${{ env.src }}
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ inputs.repo }}
+          ISSUE: ${{ inputs.issue }}
+          BRANCH: ${{ inputs.branch }}
+          TITLE: ${{ steps.gate.outputs.title }}
+          REVIEWERS: ${{ inputs.reviewers }}
+          PR_OPEN: ${{ inputs.pr_open_label }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(git log "origin/$default..HEAD" --oneline)" ]; then
+            gh issue comment "$ISSUE" --repo "$REPO" --body "Build run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} committed nothing; the ticket needs a person. Its approval stands."
+            exit 0; fi
+          git push -u origin "$BRANCH"
+          if ! gh pr view "$BRANCH" --repo "$REPO" >/dev/null 2>&1; then
+            gh pr create --repo "$REPO" --head "$BRANCH" --base "$default" --title "$TITLE (#$ISSUE)" --body "Closes #$ISSUE. Built from the approved specification on that issue by the pipeline's build stage. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --reviewer "$REVIEWERS" --assignee "$REVIEWERS"
+          fi
+          gh issue edit "$ISSUE" --repo "$REPO" --add-label "$PR_OPEN"
+          gh issue comment "$ISSUE" --repo "$REPO" --body "Pull request opened: $(gh pr view "$BRANCH" --repo "$REPO" --json url --jq .url)"
+
+      - name: Report a failed build on the issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ inputs.repo }}
+          ISSUE: ${{ inputs.issue }}
+        run: gh issue comment "$ISSUE" --repo "$REPO" --body "Build failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. The issue stays approved; fix the cause and it is retried on the next sweep." || true
