@@ -81,5 +81,9 @@
   "config_source": {
     "repo": "oneshotllc/.github",
     "path": "automation/pipeline.json"
+  },
+  "chain": {
+    "$comment": "Ordering inside a stream. Primary: GitHub issue dependencies (blocked_by). Fallback when that API is unavailable: a body line '<blocked_by_line> #N'.",
+    "blocked_by_line": "Blocked by:"
   }
 }
