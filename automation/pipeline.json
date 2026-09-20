@@ -53,7 +53,16 @@
   },
   "merge": {
     "method": "squash",
-    "require_state": "clean"
+    "accept_states": [
+      "clean",
+      "unstable"
+    ],
+    "ok_conclusions": [
+      "success",
+      "skipped",
+      "neutral"
+    ],
+    "$comment": "A human-approved PR merges when GitHub reports one of accept_states; for any state other than clean every counted check (ci.checks) must also have a conclusion in ok_conclusions, so a red non-required job cannot hold an approved PR."
   },
   "dependabot": {
     "author": "dependabot[bot]",
@@ -135,12 +144,13 @@
     "max_attempts": 3
   },
   "branch_protection": {
-    "$comment": "Applied to every active repository's default branch by deploy/ensure-branch-protection.sh. The check context is required only where the repository produces it (a workflow job named like the context); requiring a context a repo never reports would block it forever.",
+    "$comment": "Applied to every active repository's default branch by deploy/ensure-branch-protection.sh. The check context is required only where the repository produces it (a workflow job named like the context); requiring a context a repo never reports would block it forever. require_up_to_date=false: a branch that is merely behind its base still merges; with dismiss_stale_reviews on, forcing an update commit would dismiss the approval it was waiting on.",
     "required_reviews": 1,
     "dismiss_stale_reviews": true,
     "enforce_admins": true,
     "require_conversation_resolution": false,
     "allow_force_pushes": false,
-    "allow_deletions": false
+    "allow_deletions": false,
+    "require_up_to_date": false
   }
 }

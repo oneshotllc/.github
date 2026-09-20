@@ -1,7 +1,0 @@
-{
-  "$comment": "Routing table for the NodeMation sorter (oneshotllc/.github#29). The sorter matches `owner/repo` against rules in order; first match wins; no match falls to `default`. Edit here, never in n8n. JSON because n8n's Code sandbox has no YAML parser.",
-  "default": "oneshotllc",
-  "rules": [
-    { "repo": "*", "stream": "oneshotllc" }
-  ]
-}
