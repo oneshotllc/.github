@@ -46,7 +46,9 @@
       "issue_comment",
       "pull_request",
       "pull_request_review",
-      "pull_request_review_comment"
+      "pull_request_review_comment",
+      "check_run",
+      "workflow_run"
     ]
   },
   "merge": {
@@ -116,5 +118,17 @@
       "changes_requested",
       "commented"
     ]
+  },
+  "ci": {
+    "$comment": "Which check runs count as the tests of a pull request when the base branch declares no required status contexts.",
+    "checks": [
+      "check"
+    ]
+  },
+  "repair": {
+    "$comment": "A failing required (or configured CI) check on a pipeline PR becomes a repair build on that PR's branch. Attempts are counted per PR; at the cap the PR and its issue get a comment and the needs-triage label and nothing more runs.",
+    "claim_prefix": "repair:",
+    "attempts_prefix": "repair-attempts:",
+    "max_attempts": 3
   }
 }
