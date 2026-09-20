@@ -129,7 +129,7 @@ jobs:
           if ! gh pr view "$BRANCH" --repo "$REPO" >/dev/null 2>&1; then
             gh pr create --repo "$REPO" --head "$BRANCH" --base "$default" --title "$TITLE (#$ISSUE)" --body "Closes #$ISSUE. Built from the approved specification on that issue by the pipeline's build stage. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --reviewer "$REVIEWERS" --assignee "$REVIEWERS"
           fi
-          gh issue edit "$ISSUE" --repo "$REPO" --add-label "$PR_OPEN"
+          gh api -X POST "repos/$REPO/issues/$ISSUE/labels" -f "labels[]=$PR_OPEN" >/dev/null   # creates the label if the repo lacks it
           gh issue comment "$ISSUE" --repo "$REPO" --body "Pull request opened: $(gh pr view "$BRANCH" --repo "$REPO" --json url --jq .url)"
 
       - name: Report a failed build on the issue
