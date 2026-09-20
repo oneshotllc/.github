@@ -1,16 +1,86 @@
 {
   "$comment": "Single configuration source for the NodeMation pipeline. Workflows contain mechanics only; every name, label, policy and target lives here. A loader workflow syncs this file into Redis key cfg:pipeline; every workflow reads that key at the start of a run.",
   "org": "oneshotllc",
-  "streams": { "default": "oneshotllc", "rules": [ { "repo": "*", "stream": "oneshotllc" } ] },
-  "queues": { "intake": "queue:intake", "stream_prefix": "queue:", "build_prefix": "queue:build:" },
-  "keys": { "seen_prefix": "seen:", "spec_prefix": "spec:", "build_prefix": "build:", "redelivered_prefix": "redelivered:", "metrics_queue_depth": "metrics:queue-depth", "webhook_secret": "cfg:gh_webhook_secret" },
-  "labels": { "hold": "hold", "pr_open": "pr-open", "shipped": "shipped", "needs_triage": "needs:triage" },
-  "approvers": ["bwoestman"],
-  "bots": ["oneshot-pr-bot[bot]", "dependabot[bot]", "github-actions[bot]"],
-  "ingress": { "path": "github-issue-triage", "events": ["issues", "issue_comment", "pull_request", "pull_request_review", "pull_request_review_comment"] },
-  "merge": { "method": "squash", "require_state": "clean" },
-  "dependabot": { "author": "dependabot[bot]", "auto_merge": true, "require_checks": true, "ok_conclusions": ["success", "skipped", "neutral"] },
-  "redelivery": { "window_minutes": 60, "once_ttl_seconds": 86400 },
-  "evidence": { "queue_depth_report": { "repo": "oneshotllc/.github", "issue": 29, "cron": "30 14 * * *" } },
-  "spec": { "sentinel": "TDD/BDD Execution Spec" }
+  "streams": {
+    "default": "oneshotllc",
+    "rules": [
+      {
+        "repo": "*",
+        "stream": "oneshotllc"
+      }
+    ]
+  },
+  "queues": {
+    "intake": "queue:intake",
+    "stream_prefix": "queue:",
+    "build_prefix": "queue:build:"
+  },
+  "keys": {
+    "seen_prefix": "seen:",
+    "spec_prefix": "spec:",
+    "build_prefix": "build:",
+    "redelivered_prefix": "redelivered:",
+    "metrics_queue_depth": "metrics:queue-depth",
+    "webhook_secret": "cfg:gh_webhook_secret"
+  },
+  "labels": {
+    "hold": "hold",
+    "pr_open": "pr-open",
+    "shipped": "shipped",
+    "needs_triage": "needs:triage"
+  },
+  "approvers": [
+    "bwoestman"
+  ],
+  "bots": [
+    "oneshot-pr-bot[bot]",
+    "dependabot[bot]",
+    "github-actions[bot]"
+  ],
+  "ingress": {
+    "path": "github-issue-triage",
+    "events": [
+      "issues",
+      "issue_comment",
+      "pull_request",
+      "pull_request_review",
+      "pull_request_review_comment"
+    ]
+  },
+  "merge": {
+    "method": "squash",
+    "require_state": "clean"
+  },
+  "dependabot": {
+    "author": "dependabot[bot]",
+    "auto_merge": true,
+    "require_checks": true,
+    "ok_conclusions": [
+      "success",
+      "skipped",
+      "neutral"
+    ]
+  },
+  "redelivery": {
+    "window_minutes": 60,
+    "once_ttl_seconds": 86400
+  },
+  "evidence": {
+    "queue_depth_report": {
+      "repo": "oneshotllc/.github",
+      "issue": 29,
+      "cron": "30 14 * * *"
+    }
+  },
+  "spec": {
+    "sentinel": "TDD/BDD Execution Spec"
+  },
+  "monitor": {
+    "actions_repo": "oneshotllc/.github",
+    "site_url": "https://oneshot.help/"
+  },
+  "config_source": {
+    "repo": "oneshotllc/.github",
+    "path": "automation/pipeline.json"
+  }
 }
