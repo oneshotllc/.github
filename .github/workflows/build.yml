@@ -22,6 +22,7 @@ on:
       reviewers:     { description: "comma-separated logins to request review from", type: string, required: true }
       runner_label:  { description: "self-hosted runner label", type: string, required: true }
       spec_sentinel: { description: "text that identifies the specification comment", type: string, required: true }
+      agent:         { description: "coding agent command available on the runner", type: string, required: true }
 
 concurrency:
   group: build-${{ inputs.repo }}-${{ inputs.issue }}
@@ -92,17 +93,20 @@ jobs:
         env:
           REPO: ${{ inputs.repo }}
           ISSUE: ${{ inputs.issue }}
+          AGENT: ${{ inputs.agent }}
         run: |
           set -euo pipefail
-          prompt=$(cat <<PROMPT
-          You are building GitHub issue #$ISSUE in repository $REPO. You are in a fresh checkout on the branch this ticket builds on. Work here and nowhere else.
+          export PATH="$HOME/.local/bin:$PATH"
+          cat > "$RUNNER_TEMP/prompt.md" <<'PROMPT'
+          You are building a GitHub issue in a fresh checkout on the branch this ticket builds on. Work here and nowhere else.
 
-          The issue body is in $RUNNER_TEMP/issue.md and the approved specification comment is in $RUNNER_TEMP/spec.md. Follow the specification; where it is silent, make the smallest change that satisfies the ticket.
+          The issue body is in the file named by ISSUE_FILE and the approved specification comment is in the file named by SPEC_FILE (both paths are given below). Follow the specification; where it is silent, make the smallest change that satisfies the ticket.
 
           Write the failing test first, run it, then make it pass. Run the repository's own lint, typecheck, test and build commands if they exist and leave them green. Commit on the current branch with a message that says what changed and why. Do not push and do not open a pull request; the workflow does that after you stop.
           PROMPT
-          )
-          claude -p "$prompt" --permission-mode acceptEdits --max-turns 60 \
+          printf '\nISSUE_FILE=%s\nSPEC_FILE=%s\nREPO=%s\nISSUE=%s\n' "$RUNNER_TEMP/issue.md" "$RUNNER_TEMP/spec.md" "$REPO" "$ISSUE" >> "$RUNNER_TEMP/prompt.md"
+          "$AGENT" -p "$(cat "$RUNNER_TEMP/prompt.md")" --permission-mode acceptEdits --max-turns 60 \
+            --add-dir "$RUNNER_TEMP" \
             --allowedTools "Read,Grep,Glob,Edit,Write,Bash(npm ci:*),Bash(npm install:*),Bash(npm run:*),Bash(npm test:*),Bash(npx:*),Bash(node:*),Bash(git add:*),Bash(git commit:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(ls:*),Bash(cat:*)" \
             2>&1 | tail -c 20000
 
