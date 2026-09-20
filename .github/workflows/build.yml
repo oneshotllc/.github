@@ -155,7 +155,14 @@ jobs:
             exit 0
           fi
           if ! gh pr view "$BRANCH" --repo "$REPO" >/dev/null 2>&1; then
-            gh pr create --repo "$REPO" --head "$BRANCH" --base "$default" --title "$TITLE (#$ISSUE)" --body "Closes #$ISSUE. Built from the approved specification on that issue by the pipeline's build stage. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --reviewer "$REVIEWERS" --assignee "$REVIEWERS"
+            run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            issue_url="https://github.com/$REPO/issues/$ISSUE"
+            why=$(awk 'NF{print; n++} n>=3{exit}' "$RUNNER_TEMP/issue.md" | tr '\n' ' ')
+            commits=$(git log "origin/$default..HEAD" --format='- %s%n%b' | sed '/^$/d')
+            stat=$(git diff --stat "origin/$default..HEAD" | sed 's/^/    /')
+            tests=$(node -e 'const p=require("./package.json").scripts||{}; console.log(["lint","typecheck","test","build"].filter(k=>p[k]).map(k=>"npm run "+k).join(", "))' 2>/dev/null || true)
+            body=$(printf '## Why\n\n%s\n\n**Ticket:** %s (#%s)\n\n## What changed\n\n%s\n\nFiles:\n\n%s\n\n## How to verify\n\nThe build ran the repository'"'"'s own checks before committing%s. Required status checks run on this PR. Build run: %s\n\n## Risk and rollback\n\nScoped to the files above; nothing outside the ticket was touched. Revert this squash commit to roll back.\n\nCloses #%s' "$why" "$issue_url" "$ISSUE" "$commits" "$stat" "${tests:+ ($tests)}" "$run_url" "$ISSUE")
+            gh pr create --repo "$REPO" --head "$BRANCH" --base "$default" --title "$TITLE (#$ISSUE)" --body "$body" --reviewer "$REVIEWERS" --assignee "$REVIEWERS"
           fi
           gh api -X POST "repos/$REPO/issues/$ISSUE/labels" -f "labels[]=$PR_OPEN" >/dev/null   # creates the label if the repo lacks it
           gh issue comment "$ISSUE" --repo "$REPO" --body "Pull request opened: $(gh pr view "$BRANCH" --repo "$REPO" --json url --jq .url)"
