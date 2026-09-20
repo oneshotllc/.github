@@ -23,6 +23,7 @@ on:
       runner_label:  { description: "self-hosted runner label", type: string, required: true }
       spec_sentinel: { description: "text that identifies the specification comment", type: string, required: true }
       agent:         { description: "coding agent command available on the runner", type: string, required: true }
+      mode:          { description: "build (new work from the spec) or feedback (address review comments on the open PR)", type: string, required: false, default: "build" }
 
 concurrency:
   group: build-${{ inputs.repo }}-${{ inputs.issue }}
@@ -75,18 +76,32 @@ jobs:
           if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then git checkout -B "$BRANCH" "origin/$BRANCH"; else git checkout -B "$BRANCH" "origin/$default"; fi
           echo "default=$default" >> "$GITHUB_ENV"; echo "src=$dir" >> "$GITHUB_ENV"
 
-      - name: Read the specification comment
+      - name: Read the specification, or the review feedback in feedback mode
         id: spec
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           REPO: ${{ inputs.repo }}
           ISSUE: ${{ inputs.issue }}
+          BRANCH: ${{ inputs.branch }}
           SENTINEL: ${{ inputs.spec_sentinel }}
+          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
-          gh api "repos/$REPO/issues/$ISSUE/comments" --paginate --jq '[.[] | select(.body | contains(env.SENTINEL))] | last | .body // empty' > "$RUNNER_TEMP/spec.md"
-          [ -s "$RUNNER_TEMP/spec.md" ] || { echo "::error::No specification comment found on #$ISSUE; the triage step has not run."; exit 1; }
           gh issue view "$ISSUE" --repo "$REPO" --json body --jq .body > "$RUNNER_TEMP/issue.md"
+          gh api "repos/$REPO/issues/$ISSUE/comments" --paginate --jq '[.[] | select(.body | contains(env.SENTINEL))] | last | .body // empty' > "$RUNNER_TEMP/spec.md"
+          if [ "$MODE" = "feedback" ]; then
+            pr=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq '.[0].number')
+            [ -n "$pr" ] || { echo "::error::No open PR on $BRANCH to take feedback for."; exit 1; }
+            { echo "# Review feedback on pull request #$pr"; echo
+              gh api "repos/$REPO/pulls/$pr/reviews" --paginate --jq '.[] | select(.body != "" and .body != null) | "## Review by \(.user.login) (\(.state))\n\(.body)\n"'
+              gh api "repos/$REPO/pulls/$pr/comments" --paginate --jq '.[] | "## Comment by \(.user.login) on \(.path) line \(.line // .original_line)\n\(.body)\n"'
+              gh api "repos/$REPO/issues/$pr/comments" --paginate --jq '.[] | select(.user.type != "Bot") | "## Conversation comment by \(.user.login)\n\(.body)\n"'
+            } > "$RUNNER_TEMP/feedback.md"
+            [ "$(wc -c < "$RUNNER_TEMP/feedback.md")" -gt 60 ] || { echo "::error::No review feedback found on PR #$pr."; exit 1; }
+            echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          else
+            [ -s "$RUNNER_TEMP/spec.md" ] || { echo "::error::No specification comment found on #$ISSUE; the triage step has not run."; exit 1; }
+          fi
 
       - name: Build the ticket with the coding agent
         working-directory: ${{ env.src }}
@@ -94,6 +109,7 @@ jobs:
           REPO: ${{ inputs.repo }}
           ISSUE: ${{ inputs.issue }}
           AGENT: ${{ inputs.agent }}
+          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
@@ -104,6 +120,14 @@ jobs:
 
           Write the failing test first, run it, then make it pass. Run the repository's own lint, typecheck, test and build commands if they exist and leave them green. Commit on the current branch with a message that says what changed and why. Do not push and do not open a pull request; the workflow does that after you stop.
           PROMPT
+          if [ "$MODE" = "feedback" ]; then
+            cat > "$RUNNER_TEMP/prompt.md" <<'PROMPT'
+          You are addressing review feedback on an open pull request, in a fresh checkout of that PR's branch. Work here and nowhere else.
+
+          The original issue is in the file named by ISSUE_FILE, the approved specification in SPEC_FILE, and every review comment in FEEDBACK_FILE. Address each piece of feedback: change what the reviewer asked for, keep the tests green, add or adjust tests where the feedback implies behaviour. Commit on the current branch with a message that says which feedback each change answers. Do not push and do not open anything; the workflow pushes after you stop.
+          PROMPT
+            printf '\nFEEDBACK_FILE=%s' "$RUNNER_TEMP/feedback.md" >> "$RUNNER_TEMP/prompt.md"
+          fi
           printf '\nISSUE_FILE=%s\nSPEC_FILE=%s\nREPO=%s\nISSUE=%s\n' "$RUNNER_TEMP/issue.md" "$RUNNER_TEMP/spec.md" "$REPO" "$ISSUE" >> "$RUNNER_TEMP/prompt.md"
           "$AGENT" -p "$(cat "$RUNNER_TEMP/prompt.md")" --permission-mode acceptEdits --max-turns 60 \
             --add-dir "$RUNNER_TEMP" \
@@ -122,10 +146,14 @@ jobs:
           PR_OPEN: ${{ inputs.pr_open_label }}
         run: |
           set -euo pipefail
-          if [ -z "$(git log "origin/$default..HEAD" --oneline)" ]; then
+          if [ -z "$(git log "origin/$default..HEAD" --oneline)" ] || { [ "${{ inputs.mode }}" = "feedback" ] && [ -z "$(git log "origin/$BRANCH..HEAD" --oneline 2>/dev/null)" ]; }; then
             gh issue comment "$ISSUE" --repo "$REPO" --body "Build run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} committed nothing; the ticket needs a person. Its approval stands."
             exit 0; fi
           git push -u origin "$BRANCH"
+          if [ "${{ inputs.mode }}" = "feedback" ]; then
+            gh pr comment "$BRANCH" --repo "$REPO" --body "Addressed the review feedback in a new commit on this branch. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            exit 0
+          fi
           if ! gh pr view "$BRANCH" --repo "$REPO" >/dev/null 2>&1; then
             gh pr create --repo "$REPO" --head "$BRANCH" --base "$default" --title "$TITLE (#$ISSUE)" --body "Closes #$ISSUE. Built from the approved specification on that issue by the pipeline's build stage. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --reviewer "$REVIEWERS" --assignee "$REVIEWERS"
           fi
