@@ -23,7 +23,7 @@ on:
       runner_label:  { description: "self-hosted runner label", type: string, required: true }
       spec_sentinel: { description: "text that identifies the specification comment", type: string, required: true }
       agent:         { description: "coding agent command available on the runner", type: string, required: true }
-      mode:          { description: "build (new work from the spec) or feedback (address review comments on the open PR)", type: string, required: false, default: "build" }
+      mode:          { description: "build (new work from the spec), feedback (address review comments on the open PR) or repair (fix a failing check on the open PR)", type: string, required: false, default: "build" }
 
 concurrency:
   group: build-${{ inputs.repo }}-${{ inputs.issue }}
@@ -89,7 +89,17 @@ jobs:
           set -euo pipefail
           gh issue view "$ISSUE" --repo "$REPO" --json body --jq .body > "$RUNNER_TEMP/issue.md"
           gh api "repos/$REPO/issues/$ISSUE/comments" --paginate --jq '[.[] | select(.body | contains(env.SENTINEL))] | last | .body // empty' > "$RUNNER_TEMP/spec.md"
-          if [ "$MODE" = "feedback" ]; then
+          if [ "$MODE" = "repair" ]; then
+            pr=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq '.[0].number')
+            [ -n "$pr" ] || { echo "::error::No open PR on $BRANCH to repair."; exit 1; }
+            sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid)
+            { echo "# Failing checks on pull request #$pr (head $sha)"; echo
+              gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" --jq '.check_runs[] | select(.conclusion != null and .conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral") | "## \(.name): \(.conclusion)\nrun: \(.html_url)\n"'
+              for rid in $(gh api "repos/$REPO/actions/runs?head_sha=$sha&status=failure&per_page=10" --jq '.workflow_runs[].id'); do
+                echo "### Failed log excerpt, run $rid"; echo '```'; gh run view "$rid" --repo "$REPO" --log-failed 2>/dev/null | grep -v -E '^\s*$' | tail -n 200 | cut -c1-400; echo '```'; done
+            } > "$RUNNER_TEMP/feedback.md"
+            echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          elif [ "$MODE" = "feedback" ]; then
             pr=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq '.[0].number')
             [ -n "$pr" ] || { echo "::error::No open PR on $BRANCH to take feedback for."; exit 1; }
             { echo "# Review feedback on pull request #$pr"; echo
@@ -110,6 +120,7 @@ jobs:
           ISSUE: ${{ inputs.issue }}
           AGENT: ${{ inputs.agent }}
           MODE: ${{ inputs.mode }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
@@ -120,7 +131,17 @@ jobs:
 
           Write the failing test first, run it, then make it pass. Run the repository's own lint, typecheck, test and build commands if they exist and leave them green. Commit on the current branch with a message that says what changed and why. Do not push and do not open a pull request; the workflow does that after you stop.
           PROMPT
-          if [ "$MODE" = "feedback" ]; then
+          if [ "$MODE" = "repair" ]; then
+            cat > "$RUNNER_TEMP/prompt.md" <<'PROMPT'
+          You are repairing a failing check on an open pull request, in a fresh checkout of that PR's branch.
+
+          The original issue is in the file named by ISSUE_FILE, the approved specification in SPEC_FILE, and the failing checks with their log excerpts in FEEDBACK_FILE. Find the cause of the failure and decide where the fix belongs:
+
+          - If the fix belongs in this repository: make it here, run the repository's own lint, typecheck, test and build commands, leave them green, and commit on the current branch with a message that names the failing check and what you changed. Do not push.
+          - If the fix requires a change in a different repository (a reusable workflow, a shared package, a template this repository consumes): change nothing on this branch. Instead open one issue in that repository with `gh issue create`, quoting the failing check, the run link and the reason, and print its URL as the last line of your output. Do not commit anything here.
+          PROMPT
+            printf '\nFEEDBACK_FILE=%s' "$RUNNER_TEMP/feedback.md" >> "$RUNNER_TEMP/prompt.md"
+          elif [ "$MODE" = "feedback" ]; then
             cat > "$RUNNER_TEMP/prompt.md" <<'PROMPT'
           You are addressing review feedback on an open pull request, in a fresh checkout of that PR's branch. Work here and nowhere else.
 
@@ -131,7 +152,7 @@ jobs:
           printf '\nISSUE_FILE=%s\nSPEC_FILE=%s\nREPO=%s\nISSUE=%s\n' "$RUNNER_TEMP/issue.md" "$RUNNER_TEMP/spec.md" "$REPO" "$ISSUE" >> "$RUNNER_TEMP/prompt.md"
           "$AGENT" -p "$(cat "$RUNNER_TEMP/prompt.md")" --permission-mode acceptEdits --max-turns 60 \
             --add-dir "$RUNNER_TEMP" \
-            --allowedTools "Read,Grep,Glob,Edit,Write,Bash(npm ci:*),Bash(npm install:*),Bash(npm run:*),Bash(npm test:*),Bash(npx:*),Bash(node:*),Bash(git add:*),Bash(git commit:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(ls:*),Bash(cat:*)" \
+            --allowedTools "Read,Grep,Glob,Edit,Write,Bash(npm ci:*),Bash(npm install:*),Bash(npm run:*),Bash(npm test:*),Bash(npx:*),Bash(node:*),Bash(git add:*),Bash(git commit:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(ls:*),Bash(cat:*)$([ "$MODE" = "repair" ] && printf ',Bash(gh issue create:*),Bash(gh issue view:*),Bash(gh api:*)')" \
             2>&1 | tail -c 20000
 
       - name: Push the branch and open the pull request
@@ -146,12 +167,17 @@ jobs:
           PR_OPEN: ${{ inputs.pr_open_label }}
         run: |
           set -euo pipefail
-          if [ -z "$(git log "origin/$default..HEAD" --oneline)" ] || { [ "${{ inputs.mode }}" = "feedback" ] && [ -z "$(git log "origin/$BRANCH..HEAD" --oneline 2>/dev/null)" ]; }; then
-            gh issue comment "$ISSUE" --repo "$REPO" --body "Build run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} committed nothing; the ticket needs a person. Its approval stands."
+          if [ -z "$(git log "origin/$default..HEAD" --oneline)" ] || { { [ "${{ inputs.mode }}" = "feedback" ] || [ "${{ inputs.mode }}" = "repair" ]; } && [ -z "$(git log "origin/$BRANCH..HEAD" --oneline 2>/dev/null)" ]; }; then
+            if [ "${{ inputs.mode }}" = "repair" ]; then
+              gh pr comment "$BRANCH" --repo "$REPO" --body "Repair run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} changed nothing on this branch: the cause was judged to live outside this repository (an issue was opened there if the agent found one; see the run log) or could not be fixed automatically. A person decides next."
+            else
+              gh issue comment "$ISSUE" --repo "$REPO" --body "Build run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} committed nothing; the ticket needs a person. Its approval stands."
+            fi
             exit 0; fi
           git push -u origin "$BRANCH"
-          if [ "${{ inputs.mode }}" = "feedback" ]; then
-            gh pr comment "$BRANCH" --repo "$REPO" --body "Addressed the review feedback in a new commit on this branch. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ "${{ inputs.mode }}" = "feedback" ] || [ "${{ inputs.mode }}" = "repair" ]; then
+            what="Addressed the review feedback"; [ "${{ inputs.mode }}" = "repair" ] && what="Repaired the failing check"
+            gh pr comment "$BRANCH" --repo "$REPO" --body "$what in a new commit on this branch. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             exit 0
           fi
           if ! gh pr view "$BRANCH" --repo "$REPO" >/dev/null 2>&1; then
