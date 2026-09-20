@@ -133,5 +133,14 @@
     "claim_prefix": "repair:",
     "attempts_prefix": "repair-attempts:",
     "max_attempts": 3
+  },
+  "branch_protection": {
+    "$comment": "Applied to every active repository's default branch by deploy/ensure-branch-protection.sh. The check context is required only where the repository produces it (a workflow job named like the context); requiring a context a repo never reports would block it forever.",
+    "required_reviews": 1,
+    "dismiss_stale_reviews": true,
+    "enforce_admins": true,
+    "require_conversation_resolution": false,
+    "allow_force_pushes": false,
+    "allow_deletions": false
   }
 }
