@@ -177,7 +177,8 @@ jobs:
           git push -u origin "$BRANCH"
           if [ "${{ inputs.mode }}" = "feedback" ] || [ "${{ inputs.mode }}" = "repair" ]; then
             what="Addressed the review feedback"; [ "${{ inputs.mode }}" = "repair" ] && what="Repaired the failing check"
-            gh pr comment "$BRANCH" --repo "$REPO" --body "$what in a new commit on this branch. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            gh pr comment "$BRANCH" --repo "$REPO" --body "$what in a new commit on this branch. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. Branch protection dismisses an earlier approval when a commit lands, so review has been requested again."
+            gh pr edit "$BRANCH" --repo "$REPO" --add-reviewer "$REVIEWERS" >/dev/null || true
             exit 0
           fi
           if ! gh pr view "$BRANCH" --repo "$REPO" >/dev/null 2>&1; then
