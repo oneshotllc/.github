@@ -100,6 +100,7 @@
       "--max-turns",
       "60"
     ],
-    "timeout_minutes": 60
+    "timeout_minutes": 60,
+    "ref": "main"
   }
 }
