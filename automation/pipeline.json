@@ -59,7 +59,11 @@
       "success",
       "skipped",
       "neutral"
-    ]
+    ],
+    "checks": [
+      "check"
+    ],
+    "$comment": "Dependency-bot PRs are pre-approved. Tested means: every required status context on the base branch is green; if the branch declares none, every check run named in `checks` is green. Other jobs never block."
   },
   "redelivery": {
     "window_minutes": 60,
