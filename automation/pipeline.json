@@ -102,5 +102,13 @@
     ],
     "timeout_minutes": 60,
     "ref": "main"
+  },
+  "feedback": {
+    "$comment": "Review feedback on a pipeline PR becomes a build item on the same branch. Dedupe per review/comment id.",
+    "claim_prefix": "feedback:",
+    "review_states": [
+      "changes_requested",
+      "commented"
+    ]
   }
 }
