@@ -27,7 +27,9 @@
     "hold": "hold",
     "pr_open": "pr-open",
     "shipped": "shipped",
-    "needs_triage": "needs:triage"
+    "needs_triage": "needs:triage",
+    "spec_present": "bdd",
+    "$comment": "hold = not approved; pr_open = a PR exists; shipped = merged; needs_triage = a person must look; spec_present = the issue already carries its scenarios, so triage is skipped and the spec marker is set directly."
   },
   "approvers": [
     "bwoestman"
