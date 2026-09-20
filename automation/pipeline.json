@@ -68,8 +68,7 @@
   "evidence": {
     "queue_depth_report": {
       "repo": "oneshotllc/.github",
-      "issue": 29,
-      "cron": "30 14 * * *"
+      "issue": 29
     }
   },
   "spec": {
