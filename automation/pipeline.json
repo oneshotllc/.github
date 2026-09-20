@@ -85,5 +85,21 @@
   "chain": {
     "$comment": "Ordering inside a stream. Primary: GitHub issue dependencies (blocked_by). Fallback when that API is unavailable: a body line '<blocked_by_line> #N'.",
     "blocked_by_line": "Blocked by:"
+  },
+  "build": {
+    "$comment": "Build stage: the build-queue consumer dispatches this workflow on the runner; the job runs the coding agent in a fresh checkout and opens the PR as the bot.",
+    "dispatch_repo": "oneshotllc/.github",
+    "workflow_file": "build.yml",
+    "runner_label": "oneshot-mac",
+    "branch_prefix": "issue-",
+    "agent": "claude",
+    "agent_args": [
+      "-p",
+      "--permission-mode",
+      "acceptEdits",
+      "--max-turns",
+      "60"
+    ],
+    "timeout_minutes": 60
   }
 }
