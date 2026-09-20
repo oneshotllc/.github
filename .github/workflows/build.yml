@@ -83,7 +83,7 @@ jobs:
           SENTINEL: ${{ inputs.spec_sentinel }}
         run: |
           set -euo pipefail
-          gh api "repos/$REPO/issues/$ISSUE/comments" --paginate --jq --arg s "$SENTINEL" '[.[] | select(.body | contains($s))] | last | .body // empty' > "$RUNNER_TEMP/spec.md"
+          gh api "repos/$REPO/issues/$ISSUE/comments" --paginate --jq '[.[] | select(.body | contains(env.SENTINEL))] | last | .body // empty' > "$RUNNER_TEMP/spec.md"
           [ -s "$RUNNER_TEMP/spec.md" ] || { echo "::error::No specification comment found on #$ISSUE; the triage step has not run."; exit 1; }
           gh issue view "$ISSUE" --repo "$REPO" --json body --jq .body > "$RUNNER_TEMP/issue.md"
 
