@@ -33,6 +33,7 @@ on:
       repair_label:  { description: "pipeline-repair mode: label put on the repair PR", type: string, required: false, default: "" }
       operator_repo: { description: "pipeline-repair mode: repository where defects the agent cannot fix are filed", type: string, required: false, default: "" }
       auto_merge:    { description: "pipeline-repair mode: true merges the repair PR without a review", type: string, required: false, default: "false" }
+      target_repo:   { description: "pipeline-repair mode: owner/name of the repository whose ticket the failed run was building", type: string, required: false, default: "" }
 
 concurrency:
   group: build-${{ inputs.repo }}-${{ inputs.issue }}
@@ -121,8 +122,9 @@ jobs:
               echo "## Jobs and steps"; gh run view "$run_id" --repo "$here" --json jobs --jq '.jobs[] | "### \(.name): \(.conclusion)", (.steps[] | "- \(.conclusion // .status) \(.name)")'; echo
               echo "## Failed step log (tail)"; gh run view "$run_id" --repo "$here" --log-failed 2>/dev/null | tail -c 30000; echo
             } > "$RUNNER_TEMP/feedback.md"
+            TREPO="${{ inputs.target_repo }}"; [ -n "$TREPO" ] || TREPO="$REPO"
             if [ "$ISSUE" != "0" ] && [ -n "$ISSUE" ]; then
-              { echo "# Target ticket $REPO#$ISSUE"; gh issue view "$ISSUE" --repo "$REPO" --json title,state,labels,body --jq '"\(.title) [\(.state)] labels=\([.labels[].name]|join(","))\n\n\(.body[0:4000])"'; echo; echo "## Last comments"; gh api "repos/$REPO/issues/$ISSUE/comments" --paginate --jq '.[-6:][] | "- \(.created_at) \(.user.login): \(.body[0:600])"'; } > "$RUNNER_TEMP/issue.md" 2>/dev/null || true
+              { echo "# Target ticket $TREPO#$ISSUE"; gh issue view "$ISSUE" --repo "$TREPO" --json title,state,labels,body --jq '"\(.title) [\(.state)] labels=\([.labels[].name]|join(","))\n\n\(.body[0:4000])"'; echo; echo "## Last comments"; gh api "repos/$TREPO/issues/$ISSUE/comments" --paginate --jq '.[-6:][] | "- \(.created_at) \(.user.login): \(.body[0:600])"'; } > "$RUNNER_TEMP/issue.md" 2>/dev/null || true
             else echo "(no target ticket parsed from the run name)" > "$RUNNER_TEMP/issue.md"; fi
             : > "$RUNNER_TEMP/spec.md"
             exit 0
@@ -190,7 +192,7 @@ jobs:
             printf '\nFEEDBACK_FILE=%s' "$RUNNER_TEMP/feedback.md" >> "$RUNNER_TEMP/prompt.md"
           elif [ "$MODE" = "pipeline-repair" ]; then
             cat > "$RUNNER_TEMP/prompt.md" <<'PROMPT'
-          You are the pipeline's repair agent. A run of this repository's build workflow failed; you are in a fresh checkout of this repository (the pipeline's own configuration and workflows) on a repair branch. FEEDBACK_FILE holds the failed run's name, jobs, steps and failing log; ISSUE_FILE holds the ticket that run was building, if any; REPO/ISSUE name that ticket; RUN_ID is the failed run.
+          You are the pipeline's repair agent. A run of this repository's build workflow failed; you are in a fresh checkout of this repository (the pipeline's own configuration and workflows) on a repair branch. FEEDBACK_FILE holds the failed run's name, jobs, steps and failing log; ISSUE_FILE holds the ticket that run was building, if any; TARGET_REPO/ISSUE name that ticket (TARGET_REPO is not this repository); RUN_ID is the failed run.
 
           Diagnose the cause from the log, then decide where the fix belongs, and write your decision to OUTCOME_FILE as JSON: {"outcome": "...", "summary": "...", "title": "...", "body": "..."}.
           - First run `gh pr list --repo REPO_HERE --state open --label REPAIR_LABEL` and read any open repair PR; if one already fixes this cause, outcome "already-fixed" with its URL in summary, change nothing.
@@ -200,7 +202,7 @@ jobs:
           Be precise and short in every comment and ticket. Never touch secrets, tokens or credentials. Never edit files outside this checkout.
           PROMPT
             sed -i '' "s#REPO_HERE#${{ github.repository }}#; s#REPAIR_LABEL#${{ inputs.repair_label }}#; s#OPERATOR_REPO#${{ inputs.operator_repo }}#" "$RUNNER_TEMP/prompt.md" 2>/dev/null || sed -i "s#REPO_HERE#${{ github.repository }}#; s#REPAIR_LABEL#${{ inputs.repair_label }}#; s#OPERATOR_REPO#${{ inputs.operator_repo }}#" "$RUNNER_TEMP/prompt.md"
-            printf '\nFEEDBACK_FILE=%s\nOUTCOME_FILE=%s\nRUN_ID=%s' "$RUNNER_TEMP/feedback.md" "$RUNNER_TEMP/outcome.json" "${{ inputs.run_id }}" >> "$RUNNER_TEMP/prompt.md"
+            printf '\nFEEDBACK_FILE=%s\nOUTCOME_FILE=%s\nRUN_ID=%s\nTARGET_REPO=%s' "$RUNNER_TEMP/feedback.md" "$RUNNER_TEMP/outcome.json" "${{ inputs.run_id }}" "${{ inputs.target_repo }}" >> "$RUNNER_TEMP/prompt.md"
           elif [ "$MODE" = "feedback" ]; then
             cat > "$RUNNER_TEMP/prompt.md" <<'PROMPT'
           You are addressing review feedback on an open pull request, in a fresh checkout of that PR's branch. Work here and nowhere else.
@@ -258,7 +260,8 @@ jobs:
               gh label create "${{ inputs.repair_label }}" --repo "${{ github.repository }}" --color D93F0B --description "Opened by the pipeline's repair agent" 2>/dev/null || true
               pr=$(gh pr create --repo "${{ github.repository }}" --head "$BRANCH" --base "$default" --title "$title" --body "$(printf '%s\n\nRepairs failed run: %s\nRepair run: %s' "$pbody" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ inputs.run_id }}" "$run_url")" --label "${{ inputs.repair_label }}" --reviewer "$REVIEWERS" --assignee "$REVIEWERS")
               if [ "${{ inputs.auto_merge }}" = "true" ]; then gh pr merge "$pr" --repo "${{ github.repository }}" --squash --delete-branch || gh pr merge "$pr" --repo "${{ github.repository }}" --squash --delete-branch --auto || true; fi
-              if [ -n "$ISSUE" ] && [ "$ISSUE" != "0" ]; then gh issue comment "$ISSUE" --repo "$REPO" --body "Pipeline repaired: $pr ($summary). The failed build is released again after the claim window." || true; fi
+              TREPO="${{ inputs.target_repo }}"; [ -n "$TREPO" ] || TREPO="$REPO"
+              if [ -n "$ISSUE" ] && [ "$ISSUE" != "0" ]; then gh issue comment "$ISSUE" --repo "$TREPO" --body "Pipeline repaired: $pr ($summary). The failed build is released again after the claim window." || true; fi
             elif [ "$outcome" = "fix-here" ]; then
               echo "::error::Outcome fix-here but nothing was committed."; exit 1
             elif [ "$outcome" = "none" ] && [ "$AGENT_EXIT" != "0" ]; then
@@ -308,5 +311,6 @@ jobs:
           REPO: ${{ inputs.repo }}
           ISSUE: ${{ inputs.issue }}
         run: |
+          [ "${{ inputs.mode }}" != "pipeline-repair" ] || exit 0
           [ "$ISSUE" != "0" ] && [ -n "$ISSUE" ] || exit 0
           gh issue comment "$ISSUE" --repo "$REPO" --body "Build failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} (${{ steps.agent.outputs.reason || 'before the agent ran' }}). The issue stays approved and is released to build again ${{ inputs.claim_minutes }} minutes after this one started, up to ${{ inputs.max_attempts }} attempts in total; after that the hold label comes back and a person decides." || true
