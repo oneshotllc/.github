@@ -55,6 +55,7 @@ jobs:
           REPO: ${{ inputs.repo }}
           ISSUE: ${{ inputs.issue }}
           HOLD: ${{ inputs.hold_label }}
+          BRANCH: ${{ inputs.branch }}
         run: |
           set -euo pipefail
           json="$RUNNER_TEMP/issue.json"
@@ -63,6 +64,15 @@ jobs:
             echo "::error::Issue #$ISSUE carries the hold label again; approval was withdrawn after dispatch. Nothing written."; exit 1; fi
           if [ "$(jq -r .state "$json")" != "OPEN" ]; then echo "::error::Issue #$ISSUE is not open."; exit 1; fi
           echo "title=$(jq -r .title "$json")" >> "$GITHUB_OUTPUT"
+          # The dispatcher's note on the issue gets this run's link, so the ticket always points at the live log.
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          cid=$(gh api "repos/$REPO/issues/$ISSUE/comments" --paginate --jq '[.[] | select(.user.type == "Bot" and (.body | contains("dispatched on branch")) and (.body | contains(env.BRANCH)))] | last | .id // empty')
+          if [ -n "$cid" ]; then
+            body=$(gh api "repos/$REPO/issues/$ISSUE/comments/$cid" --jq .body)
+            printf '%s\nRun: %s' "$body" "$run_url" | gh api -X PATCH "repos/$REPO/issues/$ISSUE/comments/$cid" -F body=@- >/dev/null || true
+          else
+            gh issue comment "$ISSUE" --repo "$REPO" --body "Build run: $run_url" >/dev/null || true
+          fi
 
       - name: Fresh checkout of the target repository
         env:
