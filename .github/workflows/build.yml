@@ -154,7 +154,9 @@ jobs:
           else
             # A ticket written to the standard carries its scenarios in the body (the spec label tells triage to
             # skip it); the body is then the specification. A ticket with neither has not been triaged.
-            if [ ! -s "$RUNNER_TEMP/spec.md" ] && grep -qiE '^[[:space:]]*(Scenario|Given)\b' "$RUNNER_TEMP/issue.md"; then
+            # Scenarios arrive as Gherkin lines, as markdown bullets ("- Given ..."), numbered, or under a
+            # heading; a list marker, heading marks or bold/italic marks may precede the keyword.
+            if [ ! -s "$RUNNER_TEMP/spec.md" ] && grep -qiE '^[[:space:]]*([-*+]|[0-9]+[.)]|#+)?[[:space:]]*[*_]{0,2}(Scenarios?|Given)\b' "$RUNNER_TEMP/issue.md"; then
               cp "$RUNNER_TEMP/issue.md" "$RUNNER_TEMP/spec.md"; echo "Specification: the ticket body (scenarios present, no spec comment)."
             fi
             [ -s "$RUNNER_TEMP/spec.md" ] || { echo "::error::No specification comment and no scenarios in the body of #$ISSUE; the triage step has not run."; exit 1; }
