@@ -114,7 +114,12 @@ jobs:
             [ "$(wc -c < "$RUNNER_TEMP/feedback.md")" -gt 60 ] || { echo "::error::No review feedback found on PR #$pr."; exit 1; }
             echo "pr=$pr" >> "$GITHUB_OUTPUT"
           else
-            [ -s "$RUNNER_TEMP/spec.md" ] || { echo "::error::No specification comment found on #$ISSUE; the triage step has not run."; exit 1; }
+            # A ticket written to the standard carries its scenarios in the body (the spec label tells triage to
+            # skip it); the body is then the specification. A ticket with neither has not been triaged.
+            if [ ! -s "$RUNNER_TEMP/spec.md" ] && grep -qiE '^[[:space:]]*(Scenario|Given)\b' "$RUNNER_TEMP/issue.md"; then
+              cp "$RUNNER_TEMP/issue.md" "$RUNNER_TEMP/spec.md"; echo "Specification: the ticket body (scenarios present, no spec comment)."
+            fi
+            [ -s "$RUNNER_TEMP/spec.md" ] || { echo "::error::No specification comment and no scenarios in the body of #$ISSUE; the triage step has not run."; exit 1; }
           fi
 
       - name: Build the ticket with the coding agent
