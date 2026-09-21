@@ -1,0 +1,53 @@
+name: Bug
+description: Something that worked, or should, does not. Bugs go straight to Ready on the board.
+labels:
+  - bug
+  - hold
+  - bdd
+body:
+  - type: input
+    id: summary
+    attributes:
+      label: What is wrong
+      description: One sentence.
+      placeholder: "The build failure comment promises a retry that never happens."
+    validations:
+      required: true
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Scenario
+      description: Given / When / Then for the correct behaviour, then "But instead" for what happens today.
+      placeholder: |
+        Given an approved issue whose build failed
+        When the claim window passes
+        Then the sorter releases it again
+        But instead it is never released
+      render: gherkin
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: The run link, log line, screenshot link or API response. Real output, not a description of it.
+    validations:
+      required: true
+  - type: textarea
+    id: done_when
+    attributes:
+      label: Done when
+      description: The proof that closes this ticket, usually the scenario passing as a test in the repository's normal test command.
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - high
+        - urgent
+        - medium
+        - low
+    validations:
+      required: true

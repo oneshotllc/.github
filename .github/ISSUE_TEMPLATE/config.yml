@@ -1,1 +1,5 @@
 blank_issues_enabled: false
+contact_links:
+  - name: Pipeline board
+    url: https://github.com/orgs/oneshotllc/projects/1
+    about: Every ticket in the organization, by status. Ready is the order the pipeline works in.
