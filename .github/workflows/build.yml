@@ -258,7 +258,7 @@ jobs:
               gh label create "${{ inputs.repair_label }}" --repo "${{ github.repository }}" --color D93F0B --description "Opened by the pipeline's repair agent" 2>/dev/null || true
               pr=$(gh pr create --repo "${{ github.repository }}" --head "$BRANCH" --base "$default" --title "$title" --body "$(printf '%s\n\nRepairs failed run: %s\nRepair run: %s' "$pbody" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ inputs.run_id }}" "$run_url")" --label "${{ inputs.repair_label }}" --reviewer "$REVIEWERS" --assignee "$REVIEWERS")
               if [ "${{ inputs.auto_merge }}" = "true" ]; then gh pr merge "$pr" --repo "${{ github.repository }}" --squash --delete-branch || gh pr merge "$pr" --repo "${{ github.repository }}" --squash --delete-branch --auto || true; fi
-              [ "$ISSUE" != "0" ] && [ -n "$ISSUE" ] && gh issue comment "$ISSUE" --repo "$REPO" --body "Pipeline repaired: $pr ($summary). The failed build is released again after the claim window." || true
+              if [ -n "$ISSUE" ] && [ "$ISSUE" != "0" ]; then gh issue comment "$ISSUE" --repo "$REPO" --body "Pipeline repaired: $pr ($summary). The failed build is released again after the claim window." || true; fi
             elif [ "$outcome" = "fix-here" ]; then
               echo "::error::Outcome fix-here but nothing was committed."; exit 1
             elif [ "$outcome" = "none" ] && [ "$AGENT_EXIT" != "0" ]; then
