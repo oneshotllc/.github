@@ -16,7 +16,7 @@ jobs:
       - name: Workflows parse and lint
         run: |
           set -euo pipefail
-          curl -sSL "https://github.com/rhysd/actionlint/releases/latest/download/actionlint_$(curl -sSL https://api.github.com/repos/rhysd/actionlint/releases/latest | python3 -c 'import json,sys;print(json.load(sys.stdin)["tag_name"].lstrip("v"))')_linux_amd64.tar.gz" | tar xz actionlint
+          bash <(curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
           ./actionlint -color
       - name: Configuration is valid JSON with the required keys
         run: |
