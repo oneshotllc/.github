@@ -55,6 +55,7 @@ jobs:
           REPO: ${{ inputs.repo }}
           ISSUE: ${{ inputs.issue }}
           HOLD: ${{ inputs.hold_label }}
+          BRANCH: ${{ inputs.branch }}
         run: |
           set -euo pipefail
           json="$RUNNER_TEMP/issue.json"
@@ -63,6 +64,15 @@ jobs:
             echo "::error::Issue #$ISSUE carries the hold label again; approval was withdrawn after dispatch. Nothing written."; exit 1; fi
           if [ "$(jq -r .state "$json")" != "OPEN" ]; then echo "::error::Issue #$ISSUE is not open."; exit 1; fi
           echo "title=$(jq -r .title "$json")" >> "$GITHUB_OUTPUT"
+          # The dispatcher's note on the issue gets this run's link, so the ticket always points at the live log.
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          cid=$(gh api "repos/$REPO/issues/$ISSUE/comments" --paginate --jq '[.[] | select(.user.type == "Bot" and (.body | contains("dispatched on branch")) and (.body | contains(env.BRANCH)))] | last | .id // empty')
+          if [ -n "$cid" ]; then
+            body=$(gh api "repos/$REPO/issues/$ISSUE/comments/$cid" --jq .body)
+            printf '%s\nRun: %s' "$body" "$run_url" | gh api -X PATCH "repos/$REPO/issues/$ISSUE/comments/$cid" -F body=@- >/dev/null || true
+          else
+            gh issue comment "$ISSUE" --repo "$REPO" --body "Build run: $run_url" >/dev/null || true
+          fi
 
       - name: Fresh checkout of the target repository
         env:
@@ -114,7 +124,12 @@ jobs:
             [ "$(wc -c < "$RUNNER_TEMP/feedback.md")" -gt 60 ] || { echo "::error::No review feedback found on PR #$pr."; exit 1; }
             echo "pr=$pr" >> "$GITHUB_OUTPUT"
           else
-            [ -s "$RUNNER_TEMP/spec.md" ] || { echo "::error::No specification comment found on #$ISSUE; the triage step has not run."; exit 1; }
+            # A ticket written to the standard carries its scenarios in the body (the spec label tells triage to
+            # skip it); the body is then the specification. A ticket with neither has not been triaged.
+            if [ ! -s "$RUNNER_TEMP/spec.md" ] && grep -qiE '^[[:space:]]*(Scenario|Given)\b' "$RUNNER_TEMP/issue.md"; then
+              cp "$RUNNER_TEMP/issue.md" "$RUNNER_TEMP/spec.md"; echo "Specification: the ticket body (scenarios present, no spec comment)."
+            fi
+            [ -s "$RUNNER_TEMP/spec.md" ] || { echo "::error::No specification comment and no scenarios in the body of #$ISSUE; the triage step has not run."; exit 1; }
           fi
 
       - name: Build the ticket with the coding agent
