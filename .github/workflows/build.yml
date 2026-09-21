@@ -24,6 +24,10 @@ on:
       spec_sentinel: { description: "text that identifies the specification comment", type: string, required: true }
       agent:         { description: "coding agent command available on the runner", type: string, required: true }
       mode:          { description: "build (new work from the spec), feedback (address review comments on the open PR) or repair (fix a failing check on the open PR)", type: string, required: false, default: "build" }
+      max_turns:     { description: "turn cap for the coding agent", type: string, required: true }
+      timeout_minutes: { description: "job timeout in minutes", type: string, required: true }
+      claim_minutes: { description: "minutes before an approved issue with no PR is released to build again", type: string, required: true }
+      max_attempts:  { description: "automatic build attempts per issue before the hold label comes back", type: string, required: true }
 
 concurrency:
   group: build-${{ inputs.repo }}-${{ inputs.issue }}
@@ -34,7 +38,7 @@ permissions: {}
 jobs:
   build:
     runs-on: ${{ inputs.runner_label }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
     steps:
       - name: Mint the App token
         id: app
@@ -114,15 +118,17 @@ jobs:
           fi
 
       - name: Build the ticket with the coding agent
+        id: agent
         working-directory: ${{ env.src }}
         env:
+          MAX_TURNS: ${{ inputs.max_turns }}
           REPO: ${{ inputs.repo }}
           ISSUE: ${{ inputs.issue }}
           AGENT: ${{ inputs.agent }}
           MODE: ${{ inputs.mode }}
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           export PATH="$HOME/.local/bin:$PATH"
           cat > "$RUNNER_TEMP/prompt.md" <<'PROMPT'
           You are building a GitHub issue in a fresh checkout on the branch this ticket builds on. Work here and nowhere else.
@@ -150,10 +156,28 @@ jobs:
             printf '\nFEEDBACK_FILE=%s' "$RUNNER_TEMP/feedback.md" >> "$RUNNER_TEMP/prompt.md"
           fi
           printf '\nISSUE_FILE=%s\nSPEC_FILE=%s\nREPO=%s\nISSUE=%s\n' "$RUNNER_TEMP/issue.md" "$RUNNER_TEMP/spec.md" "$REPO" "$ISSUE" >> "$RUNNER_TEMP/prompt.md"
-          "$AGENT" -p "$(cat "$RUNNER_TEMP/prompt.md")" --permission-mode acceptEdits --max-turns 60 \
+          # Progress streams into this log as it happens; the full event stream is kept for the run.
+          # The step never fails the job by itself: the push step decides what to do with whatever the
+          # agent committed, and reports the agent's exit separately.
+          "$AGENT" -p "$(cat "$RUNNER_TEMP/prompt.md")" --permission-mode acceptEdits --max-turns "$MAX_TURNS" \
+            --output-format stream-json --verbose \
             --add-dir "$RUNNER_TEMP" \
             --allowedTools "Read,Grep,Glob,Edit,Write,Bash(npm ci:*),Bash(npm install:*),Bash(npm run:*),Bash(npm test:*),Bash(npx:*),Bash(node:*),Bash(git add:*),Bash(git commit:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(ls:*),Bash(cat:*)$([ "$MODE" = "repair" ] && printf ',Bash(gh issue create:*),Bash(gh issue view:*),Bash(gh api:*)')" \
-            2>&1 | tail -c 20000
+            2> "$RUNNER_TEMP/agent.stderr" | tee "$RUNNER_TEMP/agent.jsonl" | node -e '
+              const rl = require("readline").createInterface({ input: process.stdin });
+              const short = v => { const t = typeof v === "string" ? v : JSON.stringify(v); return t.length > 160 ? t.slice(0, 160) + "…" : t; };
+              rl.on("line", line => { let e; try { e = JSON.parse(line); } catch { return; }
+                if (e.type === "assistant" && e.message && Array.isArray(e.message.content)) for (const b of e.message.content) {
+                  if (b.type === "text" && b.text.trim()) console.log(b.text.trim());
+                  if (b.type === "tool_use") console.log("▶ " + b.name + " " + short(b.input && (b.input.command || b.input.file_path || b.input.pattern || b.input.description || b.input)));
+                }
+                if (e.type === "result") console.log("■ " + e.subtype + " turns=" + e.num_turns + " " + Math.round((e.duration_ms || 0) / 1000) + "s" + (e.is_error ? " (error)" : ""));
+              });'
+          rc=${PIPESTATUS[0]}
+          [ -s "$RUNNER_TEMP/agent.stderr" ] && { echo "--- agent stderr (tail)"; tail -c 4000 "$RUNNER_TEMP/agent.stderr"; }
+          reason=$(node -e 'const fs=require("fs"); const l=fs.readFileSync(process.argv[1],"utf8").trim().split("\n").reverse().find(x=>x.includes("\"type\":\"result\"")); if(l){const r=JSON.parse(l); console.log(r.subtype + " after " + r.num_turns + " turns")} else console.log("no result event (exit " + process.argv[2] + ")")' "$RUNNER_TEMP/agent.jsonl" "$rc" 2>/dev/null || echo "exit $rc")
+          echo "exit=$rc" >> "$GITHUB_OUTPUT"; echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "agent finished: $reason (exit $rc)"
 
       - name: Push the branch and open the pull request
         working-directory: ${{ env.src }}
@@ -165,19 +189,25 @@ jobs:
           TITLE: ${{ steps.gate.outputs.title }}
           REVIEWERS: ${{ inputs.reviewers }}
           PR_OPEN: ${{ inputs.pr_open_label }}
+          AGENT_EXIT: ${{ steps.agent.outputs.exit }}
+          AGENT_REASON: ${{ steps.agent.outputs.reason }}
         run: |
           set -euo pipefail
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if [ -z "$(git log "origin/$default..HEAD" --oneline)" ] || { { [ "${{ inputs.mode }}" = "feedback" ] || [ "${{ inputs.mode }}" = "repair" ]; } && [ -z "$(git log "origin/$BRANCH..HEAD" --oneline 2>/dev/null)" ]; }; then
-            if [ "${{ inputs.mode }}" = "repair" ]; then
+            if [ "$AGENT_EXIT" != "0" ]; then
+              echo "::error::The coding agent stopped without committing anything: $AGENT_REASON. Nothing to push."; exit 1
+            elif [ "${{ inputs.mode }}" = "repair" ]; then
               gh pr comment "$BRANCH" --repo "$REPO" --body "Repair run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} changed nothing on this branch: the cause was judged to live outside this repository (an issue was opened there if the agent found one; see the run log) or could not be fixed automatically. A person decides next."
             else
               gh issue comment "$ISSUE" --repo "$REPO" --body "Build run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} committed nothing; the ticket needs a person. Its approval stands."
             fi
             exit 0; fi
           git push -u origin "$BRANCH"
+          partial=""; [ "$AGENT_EXIT" != "0" ] && partial=" The agent stopped before it finished ($AGENT_REASON), so this is partial: read what landed against the specification, then comment on the pull request with what remains and the feedback run continues from here."
           if [ "${{ inputs.mode }}" = "feedback" ] || [ "${{ inputs.mode }}" = "repair" ]; then
             what="Addressed the review feedback"; [ "${{ inputs.mode }}" = "repair" ] && what="Repaired the failing check"
-            gh pr comment "$BRANCH" --repo "$REPO" --body "$what in a new commit on this branch. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. Branch protection dismisses an earlier approval when a commit lands, so review has been requested again."
+            gh pr comment "$BRANCH" --repo "$REPO" --body "$what in a new commit on this branch. Run: $run_url.$partial Branch protection dismisses an earlier approval when a commit lands, so review has been requested again."
             gh pr edit "$BRANCH" --repo "$REPO" --add-reviewer "$REVIEWERS" >/dev/null || true
             exit 0
           fi
@@ -189,7 +219,9 @@ jobs:
             stat=$(git diff --stat "origin/$default..HEAD" | sed 's/^/    /')
             tests=$(node -e 'const p=require("./package.json").scripts||{}; console.log(["lint","typecheck","test","build"].filter(k=>p[k]).map(k=>"npm run "+k).join(", "))' 2>/dev/null || true)
             body=$(printf '## Why\n\n%s\n\n**Ticket:** %s (#%s)\n\n## What changed\n\n%s\n\nFiles:\n\n%s\n\n## How to verify\n\nThe build ran the repository'"'"'s own checks before committing%s. Required status checks run on this PR. Build run: %s\n\n## Risk and rollback\n\nScoped to the files above; nothing outside the ticket was touched. Revert this squash commit to roll back.\n\nCloses #%s' "$why" "$issue_url" "$ISSUE" "$commits" "$stat" "${tests:+ ($tests)}" "$run_url" "$ISSUE")
-            gh pr create --repo "$REPO" --head "$BRANCH" --base "$default" --title "$TITLE (#$ISSUE)" --body "$body" --reviewer "$REVIEWERS" --assignee "$REVIEWERS"
+            draft=""; [ "$AGENT_EXIT" != "0" ] && draft="--draft"
+            gh pr create --repo "$REPO" --head "$BRANCH" --base "$default" --title "$TITLE (#$ISSUE)" --body "$body" --reviewer "$REVIEWERS" --assignee "$REVIEWERS" $draft
+            [ -n "$partial" ] && gh pr comment "$BRANCH" --repo "$REPO" --body "Opened as a draft.$partial Mark it ready for review when it is complete; drafts are never merged."
           fi
           gh api -X POST "repos/$REPO/issues/$ISSUE/labels" -f "labels[]=$PR_OPEN" >/dev/null   # creates the label if the repo lacks it
           gh issue comment "$ISSUE" --repo "$REPO" --body "Pull request opened: $(gh pr view "$BRANCH" --repo "$REPO" --json url --jq .url)"
@@ -201,4 +233,4 @@ jobs:
           REPO: ${{ inputs.repo }}
           ISSUE: ${{ inputs.issue }}
         run: |
-          gh issue comment "$ISSUE" --repo "$REPO" --body "Build failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. The issue stays approved; fix the cause and it is retried on the next sweep." || true
+          gh issue comment "$ISSUE" --repo "$REPO" --body "Build failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} (${{ steps.agent.outputs.reason || 'before the agent ran' }}). The issue stays approved and is released to build again ${{ inputs.claim_minutes }} minutes after this one started, up to ${{ inputs.max_attempts }} attempts in total; after that the hold label comes back and a person decides." || true
