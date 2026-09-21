@@ -1,0 +1,74 @@
+name: Ticket
+description: Work the pipeline can build. Decision first, scenarios, done-when. Born on hold; removing the hold approves it.
+labels:
+  - hold
+  - bdd
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One screen. Decision first, bullets not prose, real names and values. The pipeline reads the
+        scenarios as the specification and the done-when as the gate, so write them for a builder who
+        has never seen this repository.
+  - type: input
+    id: decision
+    attributes:
+      label: Decision
+      description: One sentence stating what will be true when this ticket is done.
+      placeholder: "Preview apps are destroyed when their pull request closes."
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: One short paragraph. What is wrong or missing today, with the evidence (a link, a log line, a number).
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Bullets. What changes, and what explicitly does not.
+      placeholder: |
+        - preview.yml also runs on `closed` and destroys the app
+        - production app untouched
+    validations:
+      required: true
+  - type: textarea
+    id: scenarios
+    attributes:
+      label: Scenarios
+      description: Gherkin. One Given/When/Then per behaviour, including the failure paths. These are the tests.
+      placeholder: |
+        Scenario: preview removed on merge
+          Given an open PR with a deployed preview
+          When the PR is merged
+          Then the app no longer exists and the PR carries a comment saying so
+      render: gherkin
+    validations:
+      required: true
+  - type: textarea
+    id: done_when
+    attributes:
+      label: Done when
+      description: The observable proof that closes this ticket. Name the command, the check, or the URL.
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - medium
+        - urgent
+        - high
+        - low
+    validations:
+      required: true
+  - type: input
+    id: blocked_by
+    attributes:
+      label: Blocked by
+      description: "Issue links or #numbers this must wait for, comma-separated. The pipeline builds in this order. Leave empty if none."
+      placeholder: "#48, https://github.com/oneshotllc/.github/issues/50"
