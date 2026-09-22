@@ -108,7 +108,7 @@
     "blocked_by_line": "Blocked by:"
   },
   "build": {
-    "$comment": "Build stage: the build-queue consumer dispatches this workflow on the runner; the job runs the coding agent in a fresh checkout and opens the PR as the bot. max_turns and timeout_minutes bound one run; whatever the agent committed is pushed even when it stops early (a partial build opens a draft PR). claim_minutes is how long an approved issue with no PR stays claimed before the sorter releases it again; max_attempts caps those releases, after which the hold label comes back. Issues in skip_repos are never released to the build queue (their tickets are worked by the operator, not the runner).",
+    "$comment": "Build stage: the build-queue consumer dispatches this workflow on the runner; the job runs the coding agent in a fresh checkout and opens the PR as the bot. max_turns and timeout_minutes bound one run; an unfinished build is a failed build: its commits stay on the branch, no PR is opened, the ticket gets the reason, and restoration continues from the branch. claim_minutes is how long an approved issue with no PR stays claimed before the sorter releases it again; max_attempts caps those releases, after which the hold label comes back. Issues in skip_repos are never released to the build queue (their tickets are worked by the operator, not the runner).",
     "dispatch_repo": "oneshotllc/.github",
     "workflow_file": "build.yml",
     "runner_label": "oneshot-mac",
@@ -124,11 +124,10 @@
     "max_attempts": 3
   },
   "feedback": {
-    "$comment": "Review feedback on a pipeline PR becomes a build item on the same branch. Dedupe per review/comment id.",
+    "$comment": "A submitted review that requests changes on a pipeline PR becomes a feedback build on the same branch (code review only; questions belong on the ticket). Dedupe per review id.",
     "claim_prefix": "feedback:",
     "review_states": [
-      "changes_requested",
-      "commented"
+      "changes_requested"
     ]
   },
   "ci": {
