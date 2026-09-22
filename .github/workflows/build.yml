@@ -253,6 +253,7 @@ jobs:
           [ -s "$RUNNER_TEMP/agent.stderr" ] && { echo "--- agent stderr (tail)"; tail -c 4000 "$RUNNER_TEMP/agent.stderr"; }
           reason=$(node -e 'const fs=require("fs"); const l=fs.readFileSync(process.argv[1],"utf8").trim().split("\n").reverse().find(x=>x.includes("\"type\":\"result\"")); if(l){const r=JSON.parse(l); console.log(r.subtype + " after " + r.num_turns + " turns")} else console.log("no result event (exit " + process.argv[2] + ")")' "$RUNNER_TEMP/agent.jsonl" "$rc" 2>/dev/null || echo "exit $rc")
           echo "exit=$rc" >> "$GITHUB_OUTPUT"; echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          node -e 'const fs=require("fs"); const l=fs.readFileSync(process.argv[1],"utf8").trim().split("\n").reverse().find(x=>x.includes("\"type\":\"result\"")); const r=l?JSON.parse(l):{}; fs.writeFileSync(process.argv[2], String(r.result||"").slice(0,4000));' "$RUNNER_TEMP/agent.jsonl" "$RUNNER_TEMP/final.md" 2>/dev/null || true
           echo "agent finished: $reason (exit $rc)"
 
       - name: Push the branch and open the pull request
@@ -300,8 +301,9 @@ jobs:
             exit 0; fi
           # --no-verify: the target's own pre-push hook (husky runs its tests) must not decide this run. A partial
           # build is pushed on purpose so its PR opens; `check` on the PR and the repair flow judge it from there.
-          if [ "${{ inputs.mode }}" = "build" ] && [ -s "$RUNNER_TEMP/question.md" ]; then
-            gh issue comment "$ISSUE" --repo "$REPO" --body "$(printf 'Build stopped: the ticket does not answer a question the build needs. Nothing was committed. Answer it on this ticket, then remove the hold again.\n\n%s\n\nRun: %s' "$(cat "$RUNNER_TEMP/question.md")" "$run_url")"
+          if [ "${{ inputs.mode }}" = "build" ] && { [ -s "$RUNNER_TEMP/question.md" ] || { [ "$AGENT_EXIT" = "0" ] && [ -z "$(git log "origin/$default..HEAD" --oneline)" ]; }; }; then
+            q=$(cat "$RUNNER_TEMP/question.md" 2>/dev/null); [ -n "$q" ] || q=$(cat "$RUNNER_TEMP/final.md" 2>/dev/null); [ -n "$q" ] || q="(the agent gave no reason)"
+            gh issue comment "$ISSUE" --repo "$REPO" --body "$(printf 'Build stopped: the ticket does not answer something the build needs, so nothing was committed. Answer it on this ticket, then remove the hold again.\n\n%s\n\nRun: %s' "$q" "$run_url")"
             gh issue edit "$ISSUE" --repo "$REPO" --add-label "${{ inputs.hold_label }}" --add-label needs:triage >/dev/null 2>&1 || true
             echo "::error::The ticket left a question open; back to the ticket."; exit 1
           fi
