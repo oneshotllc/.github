@@ -234,7 +234,10 @@ jobs:
           printf '\nISSUE_FILE=%s\nSPEC_FILE=%s\nREPO=%s\nISSUE=%s\n' "$RUNNER_TEMP/issue.md" "$RUNNER_TEMP/spec.md" "$REPO" "$ISSUE" >> "$RUNNER_TEMP/prompt.md"
           # Progress streams into this log as it happens; the full event stream is kept for the run.
           # The step never fails the job by itself: the push step decides what to do with whatever the
-          # agent committed, and reports the agent's exit separately.
+          # agent committed, and reports the agent's exit separately. The runner starts this step under
+          # `bash -e`, and with pipefail a non-zero agent exit (error_max_turns) would abort the script here,
+          # before its exit and reason are recorded (run 35686086587); from this line on, -e is off.
+          set +e
           "$AGENT" -p "$(cat "$RUNNER_TEMP/prompt.md")" --permission-mode acceptEdits --max-turns "$MAX_TURNS" \
             --output-format stream-json --verbose \
             --add-dir "$RUNNER_TEMP" \
