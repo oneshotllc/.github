@@ -257,6 +257,7 @@ jobs:
           echo "agent finished: $reason (exit $rc)"
 
       - name: Push the branch and open the pull request
+        id: push
         working-directory: ${{ env.src }}
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -293,7 +294,8 @@ jobs:
           if [ "${{ inputs.mode }}" = "build" ] && { [ -s "$RUNNER_TEMP/question.md" ] || { [ "$AGENT_EXIT" = "0" ] && [ -z "$(git log "origin/$default..HEAD" --oneline)" ]; }; }; then
             q=$(cat "$RUNNER_TEMP/question.md" 2>/dev/null); [ -n "$q" ] || q=$(cat "$RUNNER_TEMP/final.md" 2>/dev/null); [ -n "$q" ] || q="(the agent gave no reason)"
             gh issue comment "$ISSUE" --repo "$REPO" --body "$(printf 'Build stopped: the ticket does not answer something the build needs, so nothing was committed. Answer it on this ticket, then remove the hold again.\n\n%s\n\nRun: %s' "$q" "$run_url")"
-            gh issue edit "$ISSUE" --repo "$REPO" --add-label "${{ inputs.hold_label }}" --add-label needs:triage >/dev/null 2>&1 || true
+            gh api -X POST "repos/$REPO/issues/$ISSUE/labels" -f "labels[]=${{ inputs.hold_label }}" -f "labels[]=needs:triage" >/dev/null || true   # creates the labels if the repo lacks them
+            echo "reported=1" >> "$GITHUB_OUTPUT"
             echo "::error::The ticket left a question open; back to the ticket."; exit 1
           fi
           if [ -z "$(git log "origin/$default..HEAD" --oneline)" ] || { { [ "${{ inputs.mode }}" = "feedback" ] || [ "${{ inputs.mode }}" = "repair" ]; } && [ -z "$(git log "origin/$BRANCH..HEAD" --oneline 2>/dev/null)" ]; }; then
@@ -310,6 +312,7 @@ jobs:
           if [ "${{ inputs.mode }}" = "build" ] && [ "$AGENT_EXIT" != "0" ]; then
             git push --no-verify -u origin "$BRANCH"
             gh issue comment "$ISSUE" --repo "$REPO" --body "Build stopped before finishing ($AGENT_REASON). $(git log "origin/$default..HEAD" --oneline | wc -l | tr -d ' ') commit(s) are on branch \`$BRANCH\` and no pull request was opened; restoration continues from them. Run: $run_url"
+            echo "reported=1" >> "$GITHUB_OUTPUT"
             echo "::error::Unfinished build: $AGENT_REASON"; exit 1
           fi
           git push --no-verify -u origin "$BRANCH"
@@ -344,5 +347,6 @@ jobs:
           ISSUE: ${{ inputs.issue }}
         run: |
           [ "${{ inputs.mode }}" != "pipeline-repair" ] || exit 0
+          [ "${{ steps.push.outputs.reported }}" != "1" ] || exit 0
           [ "$ISSUE" != "0" ] && [ -n "$ISSUE" ] || exit 0
           gh issue comment "$ISSUE" --repo "$REPO" --body "Build failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} (${{ steps.agent.outputs.reason || 'before the agent ran' }}). The issue stays approved and is released to build again ${{ inputs.claim_minutes }} minutes after this one started, up to ${{ inputs.max_attempts }} attempts in total; after that the hold label comes back and a person decides." || true
