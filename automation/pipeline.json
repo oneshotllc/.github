@@ -119,7 +119,7 @@
     "skip_repos": [
       "oneshotllc/.github"
     ],
-    "max_turns": 8,
+    "max_turns": 14,
     "claim_minutes": 90,
     "max_attempts": 3
   },

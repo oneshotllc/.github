@@ -180,7 +180,7 @@ jobs:
 
           The issue body is in the file named by ISSUE_FILE and the approved specification comment is in the file named by SPEC_FILE (both paths are given below). Follow the specification; where it is silent, make the smallest change that satisfies the ticket.
 
-          Write the failing test first, run it, then make it pass. Run the repository's own lint, typecheck, test and build commands if they exist and leave them green. Commit on the current branch with a message that says what changed and why. Do not push and do not open a pull request; the workflow does that after you stop.
+          Write the failing test first, run it, then make it pass. Run the repository's own lint, typecheck, test and build commands if they exist and leave them green. Commit after every completed step (the test, the change, the fix), not only at the end: this run can be cut short, and whatever is committed is continued by the next run; whatever is not committed is lost. Each commit message says what changed and why. Do not push and do not open a pull request; the workflow does that after you stop.
 
           Scope is a hard boundary: change only what the ticket's Scope lists and leave every other file byte-identical; do not redesign, restyle, reorganise or "improve" anything the ticket does not name. If the ticket is ambiguous about what to change, or a scenario cannot be satisfied as written, stop: write the exact question to the file named by QUESTION_FILE and do not commit anything. A question is a planning failure the ticket has to answer, not something to guess at.
           PROMPT
@@ -352,4 +352,4 @@ jobs:
           [ "${{ inputs.mode }}" != "pipeline-repair" ] || exit 0
           [ "${{ steps.push.outputs.reported }}" != "1" ] || exit 0
           [ "$ISSUE" != "0" ] && [ -n "$ISSUE" ] || exit 0
-          gh issue comment "$ISSUE" --repo "$REPO" --body "Build failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} (${{ steps.agent.outputs.reason || 'before the agent ran' }}). The issue stays approved and is released to build again ${{ inputs.claim_minutes }} minutes after this one started, up to ${{ inputs.max_attempts }} attempts in total; after that the hold label comes back and a person decides." || true
+          gh issue comment "$ISSUE" --repo "$REPO" --body "Build failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} (${{ steps.agent.outputs.reason || 'before the agent ran' }}). Restoration re-dispatches this ticket at once, continuing from whatever this run committed, up to ${{ inputs.max_attempts }} attempts in total; after that the hold label comes back and a person decides." || true
