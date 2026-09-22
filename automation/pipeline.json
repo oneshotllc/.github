@@ -49,8 +49,11 @@
       "pull_request_review",
       "pull_request_review_comment",
       "check_run",
-      "workflow_run"
-    ]
+      "workflow_run",
+      "check_suite",
+      "push"
+    ],
+    "$comment": "Every event the stages consume, subscribed on every repository hook by deploy/ensure-repo-hooks.sh. Events are the path; the poller is the full backup."
   },
   "merge": {
     "method": "squash",
