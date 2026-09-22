@@ -181,7 +181,10 @@ jobs:
           The issue body is in the file named by ISSUE_FILE and the approved specification comment is in the file named by SPEC_FILE (both paths are given below). Follow the specification; where it is silent, make the smallest change that satisfies the ticket.
 
           Write the failing test first, run it, then make it pass. Run the repository's own lint, typecheck, test and build commands if they exist and leave them green. Commit on the current branch with a message that says what changed and why. Do not push and do not open a pull request; the workflow does that after you stop.
+
+          Scope is a hard boundary: change only what the ticket's Scope lists and leave every other file byte-identical; do not redesign, restyle, reorganise or "improve" anything the ticket does not name. If the ticket is ambiguous about what to change, or a scenario cannot be satisfied as written, stop: write the exact question to the file named by QUESTION_FILE and do not commit anything. A question is a planning failure the ticket has to answer, not something to guess at.
           PROMPT
+          printf '\nQUESTION_FILE=%s' "$RUNNER_TEMP/question.md" >> "$RUNNER_TEMP/prompt.md"
           if [ "$MODE" = "repair" ]; then
             cat > "$RUNNER_TEMP/prompt.md" <<'PROMPT'
           You are repairing a failing check on an open pull request, in a fresh checkout of that PR's branch.
@@ -222,6 +225,9 @@ jobs:
           In this unattended run the Edit and Write tools refuse any path under `.claude/` as a sensitive file, and nobody is here to approve it. To change such a file, write the whole new file into the directory named by SCRATCH_DIR with the Write tool and `cp` it into place; to delete or rename one, use `git rm` or `git mv`. Do not leave the ticket half-done because of that refusal, and do not report success while a test, lint, typecheck or build command is red: say what remains and why in the commit message and in your last message.
           PROMPT
             printf '\nSCRATCH_DIR=%s' "$RUNNER_TEMP" >> "$RUNNER_TEMP/prompt.md"
+          fi
+          if [ "$MODE" = "build" ] && [ -n "$(git log "origin/$default..HEAD" --oneline 2>/dev/null)" ]; then
+            { echo; echo "This branch already carries commits from an earlier attempt that stopped before finishing:"; git log "origin/$default..HEAD" --format='- %h %s'; echo "Continue from them; do not redo finished work. The ticket's latest comments (below) say why the earlier attempt stopped."; gh api "repos/$REPO/issues/$ISSUE/comments" --paginate --jq '.[-3:][] | "- \(.created_at) \(.user.login): \(.body[0:400])"'; } >> "$RUNNER_TEMP/prompt.md" 2>/dev/null || true
           fi
           printf '\nISSUE_FILE=%s\nSPEC_FILE=%s\nREPO=%s\nISSUE=%s\n' "$RUNNER_TEMP/issue.md" "$RUNNER_TEMP/spec.md" "$REPO" "$ISSUE" >> "$RUNNER_TEMP/prompt.md"
           # Progress streams into this log as it happens; the full event stream is kept for the run.
@@ -292,8 +298,18 @@ jobs:
             exit 0; fi
           # --no-verify: the target's own pre-push hook (husky runs its tests) must not decide this run. A partial
           # build is pushed on purpose so its PR opens; `check` on the PR and the repair flow judge it from there.
+          if [ "${{ inputs.mode }}" = "build" ] && [ -s "$RUNNER_TEMP/question.md" ]; then
+            gh issue comment "$ISSUE" --repo "$REPO" --body "$(printf 'Build stopped: the ticket does not answer a question the build needs. Nothing was committed. Answer it on this ticket, then remove the hold again.\n\n%s\n\nRun: %s' "$(cat "$RUNNER_TEMP/question.md")" "$run_url")"
+            gh issue edit "$ISSUE" --repo "$REPO" --add-label "${{ inputs.hold_label }}" --add-label needs:triage >/dev/null 2>&1 || true
+            echo "::error::The ticket left a question open; back to the ticket."; exit 1
+          fi
+          if [ "${{ inputs.mode }}" = "build" ] && [ "$AGENT_EXIT" != "0" ]; then
+            git push --no-verify -u origin "$BRANCH"
+            gh issue comment "$ISSUE" --repo "$REPO" --body "Build stopped before finishing ($AGENT_REASON). $(git log "origin/$default..HEAD" --oneline | wc -l | tr -d ' ') commit(s) are on branch \`$BRANCH\` and no pull request was opened; restoration continues from them. Run: $run_url"
+            echo "::error::Unfinished build: $AGENT_REASON"; exit 1
+          fi
           git push --no-verify -u origin "$BRANCH"
-          partial=""; [ "$AGENT_EXIT" != "0" ] && partial=" The agent stopped before it finished ($AGENT_REASON), so this is partial: read what landed against the specification, then comment on the pull request with what remains and the feedback run continues from here."
+          partial=""
           if [ "${{ inputs.mode }}" = "feedback" ] || [ "${{ inputs.mode }}" = "repair" ]; then
             what="Addressed the review feedback"; [ "${{ inputs.mode }}" = "repair" ] && what="Repaired the failing check"
             gh pr comment "$BRANCH" --repo "$REPO" --body "$what in a new commit on this branch. Run: $run_url.$partial Branch protection dismisses an earlier approval when a commit lands, so review has been requested again."
@@ -311,9 +327,7 @@ jobs:
             stat=$(git diff --stat "origin/$default..HEAD" | sed 's/^/    /')
             tests=$(node -e 'const p=require("./package.json").scripts||{}; console.log(["lint","typecheck","test","build"].filter(k=>p[k]).map(k=>"npm run "+k).join(", "))' 2>/dev/null || true)
             body=$(printf '## Why\n\n%s\n\n**Ticket:** %s (#%s)\n\n## What changed\n\n%s\n\nFiles:\n\n%s\n\n## How to verify\n\nThe build ran the repository'"'"'s own checks before committing%s. Required status checks run on this PR. Build run: %s\n\n## Risk and rollback\n\nScoped to the files above; nothing outside the ticket was touched. Revert this squash commit to roll back.\n\nCloses #%s' "$why" "$issue_url" "$ISSUE" "$commits" "$stat" "${tests:+ ($tests)}" "$run_url" "$ISSUE")
-            draft=""; [ "$AGENT_EXIT" != "0" ] && draft="--draft"
-            gh pr create --repo "$REPO" --head "$BRANCH" --base "$default" --title "$TITLE (#$ISSUE)" --body "$body" --reviewer "$REVIEWERS" --assignee "$REVIEWERS" $draft
-            [ -n "$partial" ] && gh pr comment "$BRANCH" --repo "$REPO" --body "Opened as a draft.$partial Mark it ready for review when it is complete; drafts are never merged."
+            gh pr create --repo "$REPO" --head "$BRANCH" --base "$default" --title "$TITLE (#$ISSUE)" --body "$body" --reviewer "$REVIEWERS" --assignee "$REVIEWERS"
           fi
           gh api -X POST "repos/$REPO/issues/$ISSUE/labels" -f "labels[]=$PR_OPEN" >/dev/null   # creates the label if the repo lacks it
           gh issue comment "$ISSUE" --repo "$REPO" --body "Pull request opened: $(gh pr view "$BRANCH" --repo "$REPO" --json url --jq .url)"
