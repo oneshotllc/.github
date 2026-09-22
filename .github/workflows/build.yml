@@ -290,6 +290,12 @@ jobs:
             fi
             exit 0
           fi
+          if [ "${{ inputs.mode }}" = "build" ] && { [ -s "$RUNNER_TEMP/question.md" ] || { [ "$AGENT_EXIT" = "0" ] && [ -z "$(git log "origin/$default..HEAD" --oneline)" ]; }; }; then
+            q=$(cat "$RUNNER_TEMP/question.md" 2>/dev/null); [ -n "$q" ] || q=$(cat "$RUNNER_TEMP/final.md" 2>/dev/null); [ -n "$q" ] || q="(the agent gave no reason)"
+            gh issue comment "$ISSUE" --repo "$REPO" --body "$(printf 'Build stopped: the ticket does not answer something the build needs, so nothing was committed. Answer it on this ticket, then remove the hold again.\n\n%s\n\nRun: %s' "$q" "$run_url")"
+            gh issue edit "$ISSUE" --repo "$REPO" --add-label "${{ inputs.hold_label }}" --add-label needs:triage >/dev/null 2>&1 || true
+            echo "::error::The ticket left a question open; back to the ticket."; exit 1
+          fi
           if [ -z "$(git log "origin/$default..HEAD" --oneline)" ] || { { [ "${{ inputs.mode }}" = "feedback" ] || [ "${{ inputs.mode }}" = "repair" ]; } && [ -z "$(git log "origin/$BRANCH..HEAD" --oneline 2>/dev/null)" ]; }; then
             if [ "$AGENT_EXIT" != "0" ]; then
               echo "::error::The coding agent stopped without committing anything: $AGENT_REASON. Nothing to push."; exit 1
@@ -301,12 +307,6 @@ jobs:
             exit 0; fi
           # --no-verify: the target's own pre-push hook (husky runs its tests) must not decide this run. A partial
           # build is pushed on purpose so its PR opens; `check` on the PR and the repair flow judge it from there.
-          if [ "${{ inputs.mode }}" = "build" ] && { [ -s "$RUNNER_TEMP/question.md" ] || { [ "$AGENT_EXIT" = "0" ] && [ -z "$(git log "origin/$default..HEAD" --oneline)" ]; }; }; then
-            q=$(cat "$RUNNER_TEMP/question.md" 2>/dev/null); [ -n "$q" ] || q=$(cat "$RUNNER_TEMP/final.md" 2>/dev/null); [ -n "$q" ] || q="(the agent gave no reason)"
-            gh issue comment "$ISSUE" --repo "$REPO" --body "$(printf 'Build stopped: the ticket does not answer something the build needs, so nothing was committed. Answer it on this ticket, then remove the hold again.\n\n%s\n\nRun: %s' "$q" "$run_url")"
-            gh issue edit "$ISSUE" --repo "$REPO" --add-label "${{ inputs.hold_label }}" --add-label needs:triage >/dev/null 2>&1 || true
-            echo "::error::The ticket left a question open; back to the ticket."; exit 1
-          fi
           if [ "${{ inputs.mode }}" = "build" ] && [ "$AGENT_EXIT" != "0" ]; then
             git push --no-verify -u origin "$BRANCH"
             gh issue comment "$ISSUE" --repo "$REPO" --body "Build stopped before finishing ($AGENT_REASON). $(git log "origin/$default..HEAD" --oneline | wc -l | tr -d ' ') commit(s) are on branch \`$BRANCH\` and no pull request was opened; restoration continues from them. Run: $run_url"
